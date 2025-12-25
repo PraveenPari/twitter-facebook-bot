@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  twitter-to-facebook-bot
+  
+  RSS-based Twitter to Facebook cross-poster using AWS Lambda and S3.
+
+Globals:
+  Function:
+    Timeout: 180
+    MemorySize: 512
+    Environment:
+      Variables:
+        S3_BUCKET_NAME: !Ref StateBucket
+        # Primary feed - HIGHEST PRIORITY (always posted immediately)
+        PRIMARY_RSS_URL: "https://rss.app/feeds/6Vpit9O1ZlzMzKqX.xml"
+        # Additional feeds - comma separated (will delay 10 mins if conflict)
+        RSS_FEEDS: "https://rss.app/feeds/JRzDV3yzKfSUj01s.xml,https://rss.app/feeds/mhXvYBo3pbDAI8VN.xml,https://rss.app/feeds/rk1HyvzYX7LCyePL.xml,https://rss.app/feeds/dKx755ccU5FJFo1O.xml"
+        # Facebook configuration
+        FB_PAGE_ID: "946593568529880"
+        FB_ACCESS_TOKEN: "EAAT9tZCqOCP0BQHAnw1ztgtu7XZAzFbpTTVF2moAJCB0GwBLZCHwwedZAVV7fTsDR0l5AUtPVwqViM9Fj5E5yuvuUZBZCQVrwZCw591j3MRUnML5i44q73Lul5L7uZBy6rM2vORFZB7OdthLhJUo3v8n5QQqBMO7cgbQobaNggoFMpV52oyOlUSZBUZAYNqWOuZCzrRLZCEbNXEuPiqzcdzRajYfoOSctGyp7scZBVpavV4vx6aLMZD"
+
+Resources:
+  StateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # BucketName will be auto-generated to ensure uniqueness if not specified
+      AccessControl: Private
+
+  CrossPostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.10
+      Architectures:
+        - x86_64
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref StateBucket
+
+  CrossPostSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: "Run Twitter to Facebook bot every 30 minutes"
+      ScheduleExpression: "rate(30 minutes)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt CrossPostFunction.Arn
+        RoleArn: !GetAtt CrossPostSchedulerRole.Arn
+
+  CrossPostSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CrossPostFunction.Arn
+
+Outputs:
+  CrossPostFunction:
+    Description: "Cross Post Lambda Function ARN"
+    Value: !GetAtt CrossPostFunction.Arn
+  StateBucketName:
+    Description: "Name of the S3 bucket storing state"
+    Value: !Ref StateBucket
