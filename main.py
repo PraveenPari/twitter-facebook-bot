@@ -619,8 +619,9 @@ def main():
     schedule_gap = settings.get('schedule_gap_minutes', DEFAULT_SCHEDULE_GAP_MINUTES)
     min_length = settings.get('min_content_length', DEFAULT_MIN_CONTENT_LENGTH)
     
-    page_id = config['facebook']['page_id']
-    token = config['facebook']['access_token']
+    # Get Facebook credentials - prioritize environment variables (for GitHub Actions)
+    page_id = os.environ.get('FB_PAGE_ID') or config['facebook']['page_id']
+    token = os.environ.get('FB_ACCESS_TOKEN') or config['facebook']['access_token']
     feeds = config.get('feeds', [])
     
     print(f"Settings: window={post_window}min, gap={schedule_gap}min, min_len={min_length}")
