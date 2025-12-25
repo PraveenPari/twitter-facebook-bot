@@ -1,35 +1,108 @@
-# Twitter (RSS) to Facebook Bot
+# Twitter to Facebook Bot 🤖
 
-A serverless bot that monitors a Twitter RSS feed for new videos and cross-posts them to Facebook using AWS Lambda.
+Automatically posts tweets from Twitter/X RSS feeds to Facebook page every 30 minutes.
 
-## Project Structure
-- `src/lambda_function.py`: Core logic (RSS check -> Check S3 -> Download -> Post FB).
-- `src/requirements.txt`: Dependencies (`yt-dlp`, `facebook-sdk`, `feedparser`).
-- `template.yaml`: AWS SAM definition for Lambda, S3, and Scheduler.
-- `run_setup.bat`: **Run this first** to install Python dependencies locally.
-- `run_tests.bat`: Run this to verify the code works (uses mock data).
+## Features
 
-## Quick Start on Windows
+✅ **Auto-posting** - Runs every 30 minutes via GitHub Actions  
+✅ **AI Enhancement** - Uses Gemini AI to enhance captions with Tamil keywords  
+✅ **SEO Hashtags** - Adds TVK positive hashtags automatically  
+✅ **Media Support** - Downloads and posts images/videos  
+✅ **Smart Filtering** - Skips retweets, replies, and duplicate posts  
+✅ **Scheduled Posts** - Spaces multiple posts 10 minutes apart  
+✅ **100% Free** - Uses GitHub Actions free tier
 
-1. **Prerequisite**: Ensure [Python 3.10](https://www.python.org/downloads/) is installed and added to your PATH.
-2. **Install Dependencies**:
-   Double-click `run_setup.bat` or run:
-   ```cmd
-   run_setup.bat
-   ```
-   This will install the required libraries into the `src/` folder so they can be deployed to AWS.
+## Setup
 
-3. **Verify Logic**:
-   Double-click `run_tests.bat` to run the test and ensure the bot logic handles RSS feeds correctly.
+### Prerequisites
 
-4. **Deploy to AWS**:
-   ```cmd
-   sam build
-   sam deploy --guided
-   ```
-   *Enter your RSS URL and Facebook Tokens when prompted.*
+1. GitHub account
+2. Facebook Page with admin access
+3. Facebook access token (get from Graph API Explorer)
+4. Gemini API key (get from https://aistudio.google.com/apikey)
 
-## Configuration Details
-- **RSS URL**: Get this from [RSS.app](https://rss.app) using the target Twitter URL.
-- **S3 Bucket**: Stores `last_tweet_id.txt` to remember the last posted tweet.
-- **Frequency**: Runs every 30 minutes by default.
+### Quick Start
+
+1. **Fork/Clone this repository**
+
+2. **Add GitHub Secrets** (Settings → Secrets → Actions)
+   - `GIST_TOKEN` - Personal access token with gist scope
+   - `GIST_ID` - Gist ID for state persistence
+   - `FB_PAGE_ID` - Your Facebook page ID
+   - `FB_ACCESS_TOKEN` - Facebook page access token
+   - `GEMINI_API_KEY` - Google Gemini API key
+   - `CONFIG_JSON` - Bot configuration (see SECRETS_REFERENCE.md)
+
+3. **Enable GitHub Actions**
+   - Go to Actions tab
+   - Enable workflows
+
+4. **Done!** Bot runs automatically every 30 minutes
+
+## Documentation
+
+- **[GITHUB_SETUP.md](GITHUB_SETUP.md)** - Detailed setup guide
+- **[SECRETS_REFERENCE.md](SECRETS_REFERENCE.md)** - All secrets and values
+
+## How It Works
+
+```
+Every 30 minutes:
+  ↓
+Check RSS feeds → Find new tweets
+  ↓
+Download media (images/videos)
+  ↓
+Enhance caption with AI (Tamil keywords)
+  ↓
+Add TVK positive hashtags
+  ↓
+Post to Facebook → Schedule if multiple posts
+  ↓
+Save state → Remember posted IDs
+```
+
+## Configuration
+
+Edit `config.json` to customize:
+
+- RSS feed URLs to monitor
+- Post time window (default: 90 minutes)
+- Minimum content length (default: 50 chars)
+- Hashtag settings
+- AI enhancement toggle
+
+## Local Testing
+
+```powershell
+# Install dependencies
+pip install -r requirements.txt
+
+# Run bot
+python main.py
+```
+
+## Schedule
+
+- **Frequency**: Every 30 minutes
+- **Cost**: FREE (GitHub Actions free tier: 2,000 minutes/month)
+- **Usage**: ~5 minutes/day = 150 minutes/month
+
+## Security
+
+✅ All sensitive tokens stored in GitHub Secrets  
+✅ Config uses environment variables  
+✅ `.gitignore` prevents token commits  
+✅ Private repository recommended
+
+## Support
+
+For issues or questions, check the documentation files or create an issue.
+
+## License
+
+MIT License - Feel free to use and modify!
+
+---
+
+**Made with ❤️ for TVK supporters**
