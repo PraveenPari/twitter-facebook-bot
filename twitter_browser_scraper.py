@@ -28,18 +28,98 @@ class TwitterBrowserScraper:
         self.page = None
         
     async def start(self):
-        """Start the browser"""
+        """Start the browser with STEALTH MODE"""
+        print("  [Browser] Started")
+        
+        # Random user agents to avoid detection
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ]
+        
+        import random
+        user_agent = random.choice(user_agents)
+        
+        # Random viewport sizes (common resolutions)
+        viewports = [
+            {'width': 1920, 'height': 1080},
+            {'width': 1366, 'height': 768},
+            {'width': 1536, 'height': 864},
+            {'width': 1440, 'height': 900},
+        ]
+        viewport = random.choice(viewports)
+        
         self.playwright = await async_playwright().start()
+        
+        # Launch browser with stealth settings
         self.browser = await self.playwright.chromium.launch(
             headless=self.headless,
-            args=['--disable-blink-features=AutomationControlled']
+            args=[
+                '--disable-blink-features=AutomationControlled',  # Hide automation
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--lang=en-US,en',
+            ]
         )
+        
+        # Create context with human-like settings
         self.context = await self.browser.new_context(
-            viewport={'width': 1280, 'height': 720},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            user_agent=user_agent,
+            viewport=viewport,
+            locale='en-US',
+            timezone_id='America/New_York',
+            permissions=['geolocation'],
+            geolocation={'latitude': 40.7128, 'longitude': -74.0060},  # New York
+            color_scheme='dark',  # Many users use dark mode
         )
+        
+        # Add extra headers to look more human
+        await self.context.set_extra_http_headers({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+        
         self.page = await self.context.new_page()
-        print("  [Browser] Started")
+        
+        # Mask automation detection
+        await self.page.add_init_script("""
+            // Overwrite the `navigator.webdriver` property
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+            
+            // Overwrite the `languages` property to use a custom getter
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+            
+            // Overwrite the `plugins` property to use a custom getter
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            
+            // Pass the Chrome Test
+            window.chrome = {
+                runtime: {},
+            };
+            
+            // Pass the Permissions Test
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
     
     async def close(self):
         """Close the browser"""
@@ -159,14 +239,25 @@ class TwitterBrowserScraper:
             # Navigate and WAIT for page load (DOM fully parsed and resources loaded)
             await self.page.goto(url, wait_until='load', timeout=30000)
             
-            # Wait for content (increased to ensure full load)
-            print(f"  [Browser] Waiting for content...")
-            await asyncio.sleep(3)
+            # HUMAN-LIKE BEHAVIOR: Random mouse movements
+            import random
+            for _ in range(random.randint(2, 4)):
+                x = random.randint(100, 800)
+                y = random.randint(100, 600)
+                await self.page.mouse.move(x, y)
+                await asyncio.sleep(random.uniform(0.1, 0.3))
             
-            # Scroll to trigger lazy loading
-            for i in range(2):  # Reduced from 5 to 2
-                await self.page.evaluate('window.scrollBy(0, 800)')
-                await asyncio.sleep(0.5)  # Reduced from 1s to 0.5s
+            # Wait for content with random delay (looks more human)
+            wait_time = random.uniform(2.5, 4.0)
+            print(f"  [Browser] Waiting {wait_time:.1f}s for content...")
+            await asyncio.sleep(wait_time)
+            
+            # HUMAN-LIKE SCROLLING: Random scroll amounts and speeds
+            scroll_times = random.randint(2, 4)
+            for i in range(scroll_times):
+                scroll_amount = random.randint(600, 1000)
+                await self.page.evaluate(f'window.scrollBy(0, {scroll_amount})')
+                await asyncio.sleep(random.uniform(0.3, 0.8))
             
             # Try multiple selectors (Twitter changes them frequently)
             tweet_elements = []
