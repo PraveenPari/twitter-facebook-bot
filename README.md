@@ -1,108 +1,104 @@
-# Twitter to Facebook Bot 🤖
+# Twitter to Facebook Bot
 
-Automatically posts tweets from Twitter/X RSS feeds to Facebook page every 30 minutes.
+Automated bot that monitors 12 TVK Twitter accounts and posts to Facebook Page.
 
 ## Features
 
-✅ **Auto-posting** - Runs every 30 minutes via GitHub Actions  
-✅ **AI Enhancement** - Uses Gemini AI to enhance captions with Tamil keywords  
-✅ **SEO Hashtags** - Adds TVK positive hashtags automatically  
-✅ **Media Support** - Downloads and posts images/videos  
-✅ **Smart Filtering** - Skips retweets, replies, and duplicate posts  
-✅ **Scheduled Posts** - Spaces multiple posts 10 minutes apart  
-✅ **100% Free** - Uses GitHub Actions free tier
+- ✅ Monitors 12 Twitter accounts simultaneously
+- ✅ Downloads images & videos
+- ✅ Filters sponsored tweets, retweets, replies
+- ✅ AI caption enhancement (Gemini)
+- ✅ SEO hashtag generation
+- ✅ Runs every 30 minutes (GitHub Actions)
+- ✅ Parallel execution (4x faster)
 
-## Setup
+## Monitored Accounts
 
-### Prerequisites
+1. @TVKVijayHQ
+2. @TVKPartyHQ
+3. @TVKHQITWingOffl
+4. @arunraajkg
+5. @ashwin_tvk_
+6. @TVKVijay24x7
+7. @BossTVK
+8. @TVK_WORLD
+9. @JegadeshTVK
+10. @PriyankaSmile01
+11. @VijayFansTrends
+12. @sangeet29332013
 
-1. GitHub account
-2. Facebook Page with admin access
-3. Facebook access token (get from Graph API Explorer)
-4. Gemini API key (get from https://aistudio.google.com/apikey)
+## Quick Start
 
-### Quick Start
-
-1. **Fork/Clone this repository**
-
-2. **Add GitHub Secrets** (Settings → Secrets → Actions)
-   - `GIST_TOKEN` - Personal access token with gist scope
-   - `GIST_ID` - Gist ID for state persistence
-   - `FB_PAGE_ID` - Your Facebook page ID
-   - `FB_ACCESS_TOKEN` - Facebook page access token
-   - `GEMINI_API_KEY` - Google Gemini API key
-   - `CONFIG_JSON` - Bot configuration (see SECRETS_REFERENCE.md)
-
-3. **Enable GitHub Actions**
-   - Go to Actions tab
-   - Enable workflows
-
-4. **Done!** Bot runs automatically every 30 minutes
-
-## Documentation
-
-- **[GITHUB_SETUP.md](GITHUB_SETUP.md)** - Detailed setup guide
-- **[SECRETS_REFERENCE.md](SECRETS_REFERENCE.md)** - All secrets and values
-
-## How It Works
-
-```
-Every 30 minutes:
-  ↓
-Check RSS feeds → Find new tweets
-  ↓
-Download media (images/videos)
-  ↓
-Enhance caption with AI (Tamil keywords)
-  ↓
-Add TVK positive hashtags
-  ↓
-Post to Facebook → Schedule if multiple posts
-  ↓
-Save state → Remember posted IDs
-```
-
-## Configuration
-
-Edit `config.json` to customize:
-
-- RSS feed URLs to monitor
-- Post time window (default: 90 minutes)
-- Minimum content length (default: 50 chars)
-- Hashtag settings
-- AI enhancement toggle
-
-## Local Testing
-
-```powershell
+```bash
 # Install dependencies
 pip install -r requirements.txt
+playwright install chromium
 
 # Run bot
 python main.py
 ```
 
-## Schedule
+## GitHub Actions (Automated)
 
-- **Frequency**: Every 30 minutes
-- **Cost**: FREE (GitHub Actions free tier: 2,000 minutes/month)
-- **Usage**: ~5 minutes/day = 150 minutes/month
+Runs every 30 minutes automatically.
 
-## Security
+### Required Secrets
 
-✅ All sensitive tokens stored in GitHub Secrets  
-✅ Config uses environment variables  
-✅ `.gitignore` prevents token commits  
-✅ Private repository recommended
+Go to: **Settings → Secrets → Actions**
 
-## Support
+| Secret | Description |
+|--------|-------------|
+| `FB_PAGE_ID` | Facebook page ID |
+| `FB_ACCESS_TOKEN` | Facebook page access token |
+| `GEMINI_API_KEY` | Gemini AI API key |
+| `CONFIG_JSON` | Twitter accounts + auth (see below) |
+| `GIST_TOKEN` | GitHub token for state storage |
+| `GIST_ID` | Gist ID for state storage |
 
-For issues or questions, check the documentation files or create an issue.
+### CONFIG_JSON Format
 
-## License
+```json
+{
+  "twitter_accounts": [
+    {"id": "tvk_vijay_hq", "username": "TVKVijayHQ", "enabled": true, "priority": 1},
+    {"id": "tvk_party_hq", "username": "TVKPartyHQ", "enabled": true, "priority": 2},
+    ...all 12 accounts
+  ],
+  "twitter_auth": {
+    "email": "praveensivapariyt@gmail.com",
+    "password": "Praveen@2026",
+    "username": "tvkmember22"
+  },
+  "settings": {
+    "post_window_minutes": 60,
+    "schedule_gap_minutes": 10,
+    "min_content_length": 50
+  }
+}
+```
 
-MIT License - Feel free to use and modify!
+Use `CONFIG_JSON.template` as reference.
 
----
+## How It Works
 
-**Made with ❤️ for TVK supporters**
+1. Logs into Twitter with credentials
+2. Checks all 12 accounts in parallel
+3. Filters out ads, retweets, replies
+4. Downloads media (images/videos)
+5. Enhances caption with AI
+6. Posts to Facebook Page
+
+## Performance
+
+- **Parallel execution:** All 12 accounts checked simultaneously
+- **Speed:** 2-3 minutes (vs 8 minutes sequential)
+- **Optimized Playwright:** Reduced wait times
+
+## Files
+
+- `main.py` - Main bot (parallel optimized)
+- `twitter_browser_scraper.py` - Twitter automation
+- `CONFIG_JSON.template` - Config template
+- `.github/workflows/bot.yml` - GitHub Actions workflow
+
+#TVK #ThalapathyVijay

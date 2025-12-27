@@ -18,11 +18,14 @@ python_bin/
 # Sensitive files - DO NOT COMMIT
 config.json
 state.json
+twitter_cookies.json
+twitter_session.json
 *.txt
 *.xml
 
 # Keep only template
 !requirements.txt
+!config_twikit_template.json
 
 # IDE
 .vscode/

@@ -1,6 +1,6 @@
 """
-Twitter to Facebook Bot - Standalone Version
-For running on GitHub Actions, Replit, or any Python environment.
+Twitter to Facebook Bot - OPTIMIZED PARALLEL VERSION
+Uses concurrent execution for faster performance
 """
 import json
 import os
@@ -9,16 +9,18 @@ import re
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 import requests
-import xml.etree.ElementTree as ET
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Import browser scraper
+from twitter_browser_scraper import TwitterBrowserScraper
 
 try:
     import yt_dlp
     HAS_YTDLP = True
 except ImportError:
     HAS_YTDLP = False
-    print("Warning: yt-dlp not installed, video support disabled")
 
 # Gemini AI for caption enhancement
 try:
@@ -27,7 +29,6 @@ try:
     HAS_GEMINI = True
 except ImportError:
     HAS_GEMINI = False
-    print("Warning: google-genai not installed, AI caption enhancement disabled")
 
 import base64
 import mimetypes
@@ -44,12 +45,10 @@ DEFAULT_MIN_CONTENT_LENGTH = 50
 
 def load_config():
     """Load config from file or environment"""
-    # Try file first
     if os.path.exists('config.json'):
         with open('config.json', 'r', encoding='utf-8') as f:
             return json.load(f)
     
-    # Try environment variable
     config_str = os.environ.get('CONFIG_JSON')
     if config_str:
         return json.loads(config_str)
@@ -75,41 +74,20 @@ def save_state(state):
 
 
 def clean_text(raw_content):
-    """Clean HTML and extract plain text from RSS content"""
+    """Clean and extract plain text from tweet content"""
     if not raw_content:
         return ''
     
     text = raw_content
-    
-    # Convert HTML line breaks
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
-    
-    # Remove all HTML tags
-    text = re.sub(r'<[^>]+>', '', text)
-    
-    # Decode HTML entities
-    text = text.replace('&amp;', '&')
-    text = text.replace('&lt;', '<')
-    text = text.replace('&gt;', '>')
-    text = text.replace('&quot;', '"')
-    text = text.replace('&#39;', "'")
-    text = text.replace('&nbsp;', ' ')
-    
-    # Remove URLs
     text = re.sub(r'https?://\S+', '', text)
-    
-    # Remove Twitter attribution
-    text = re.sub(r'—\s*[^(]+\(@\w+\)\s*\w+\s+\d+,\s+\d+', '', text)
-    
-    # Clean up whitespace
+    text = re.sub(r'^(@\w+\s*)+', '', text)
     text = re.sub(r' +', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     
     return text.strip()
 
 
-# TVK Positive Hashtags - curated list of positive hashtags
+# TVK Positive Hashtags
 TVK_POSITIVE_HASHTAGS = [
     "#TVK", "#ThamizhagaVetriKazhagam", "#Vijay", "#ThalapathyVijay",
     "#TVKForTamilNadu", "#TVKForPeople", "#TVKVision", "#TVKMovement",
@@ -120,7 +98,6 @@ TVK_POSITIVE_HASHTAGS = [
     "#TamilNaduFuture", "#TVKVictory", "#TVKPower", "#TVKStrong"
 ]
 
-# General trending/SEO hashtags for politics and news
 GENERAL_SEO_HASHTAGS = [
     "#TamilNadu", "#TNPolitics", "#TamilNews", "#Chennai",
     "#TamilNaduNews", "#PoliticalNews", "#IndianPolitics",
@@ -129,58 +106,17 @@ GENERAL_SEO_HASHTAGS = [
 ]
 
 
-def get_trending_hashtags():
-    """Try to fetch trending hashtags from free APIs"""
-    trending = []
-    
-    # Try RapidAPI Hashtag Generator (free tier)
-    try:
-        # This is a backup - will use curated list if API fails
-        url = "https://hashtagy-generate-hashtags.p.rapidapi.com/v1/custom_1/tags"
-        headers = {
-            "X-RapidAPI-Key": os.environ.get("RAPIDAPI_KEY", ""),
-            "X-RapidAPI-Host": "hashtagy-generate-hashtags.p.rapidapi.com"
-        }
-        if headers["X-RapidAPI-Key"]:
-            params = {"keyword": "TVK Tamil Nadu politics"}
-            response = requests.get(url, headers=headers, params=params, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                if "data" in data:
-                    trending = ["#" + tag for tag in data["data"][:5]]
-    except Exception as e:
-        print(f"  Trending API unavailable: {e}")
-    
-    return trending
-
-
 def generate_seo_hashtags(content="", max_hashtags=10):
-    """Generate SEO-optimized hashtags for Facebook post
-    
-    Includes:
-    - TVK positive hashtags (always included)
-    - Trending hashtags from API (if available)
-    - Content-based relevant hashtags
-    - General SEO hashtags
-    """
+    """Generate SEO-optimized hashtags"""
     hashtags = []
     
-    # Always include core TVK hashtags (pick 4-5 random ones)
     core_tvk = ["#TVK", "#ThamizhagaVetriKazhagam", "#ThalapathyVijay"]
     hashtags.extend(core_tvk)
     
-    # Add more random TVK positive hashtags
     remaining_tvk = [h for h in TVK_POSITIVE_HASHTAGS if h not in core_tvk]
     hashtags.extend(random.sample(remaining_tvk, min(3, len(remaining_tvk))))
     
-    # Try to get trending hashtags
-    trending = get_trending_hashtags()
-    if trending:
-        hashtags.extend(trending[:3])
-    
-    # Extract keywords from content and create hashtags
     if content:
-        # Common Tamil Nadu political keywords
         keyword_mapping = {
             "election": "#TNElection2026",
             "rally": "#TVKRally",
@@ -206,14 +142,12 @@ def generate_seo_hashtags(content="", max_hashtags=10):
                 if len(hashtags) >= max_hashtags - 2:
                     break
     
-    # Add general SEO hashtags to fill up
     while len(hashtags) < max_hashtags:
         remaining = [h for h in GENERAL_SEO_HASHTAGS if h not in hashtags]
         if not remaining:
             break
         hashtags.append(random.choice(remaining))
     
-    # Remove duplicates while preserving order
     seen = set()
     unique_hashtags = []
     for h in hashtags:
@@ -226,28 +160,19 @@ def generate_seo_hashtags(content="", max_hashtags=10):
 
 
 def format_post_with_hashtags(message, hashtags):
-    """Format the final post with message and hashtags"""
+    """Format final post with hashtags"""
     hashtag_text = " ".join(hashtags)
-    
-    # Add separator and hashtags at the end
     formatted = f"{message}\n\n{'─' * 30}\n{hashtag_text}"
-    
     return formatted
 
 
 def enhance_caption_with_gemini(original_caption, media_path=None, media_type='text'):
-    """
-    Use Gemini AI to enhance the caption with Tamil SEO words and emotional appeal.
-    Can analyze video/image content for better context.
-    """
+    """Use Gemini AI to enhance caption (synchronous for thread pool)"""
     if not HAS_GEMINI:
-        print("  Gemini AI not available, using original caption")
         return original_caption
     
-    # Get API key from environment or config
     api_key = os.environ.get('GEMINI_API_KEY', '')
     if not api_key:
-        # Try to load from config
         try:
             if os.path.exists('config.json'):
                 with open('config.json', 'r', encoding='utf-8') as f:
@@ -257,14 +182,11 @@ def enhance_caption_with_gemini(original_caption, media_path=None, media_type='t
             pass
     
     if not api_key:
-        print("  No Gemini API key found, using original caption")
         return original_caption
     
     try:
-        # Configure Gemini with new API
         client = genai.Client(api_key=api_key)
         
-        # Prepare the prompt for Tamil political content enhancement
         prompt = f"""You are a Tamil political social media expert for TVK (Thamizhaga Vetri Kazhagam) party led by Vijay.
 
 TASK: Enhance this caption for maximum Facebook engagement while keeping it POSITIVE about TVK.
@@ -274,12 +196,7 @@ ORIGINAL CAPTION:
 
 REQUIREMENTS:
 1. Keep the core message intact
-2. Add powerful Tamil words and phrases (transliterated) like:
-   - "மக்கள் சேவை" (Makkal Sevai - People's Service)
-   - "வெற்றி" (Vetri - Victory)  
-   - "மாற்றம்" (Maatram - Change)
-   - "நம்பிக்கை" (Nambikkai - Hope)
-   - "ஒற்றுமை" (Otrumai - Unity)
+2. Add powerful Tamil words and phrases (transliterated)
 3. Make it emotionally inspiring and hopeful
 4. Add call-to-action phrases
 5. Keep it concise (under 300 words)
@@ -287,44 +204,9 @@ REQUIREMENTS:
 7. Include 2-3 Tamil SEO words naturally
 
 ENHANCED CAPTION (respond with ONLY the enhanced caption, no explanations):"""
-
-        # Prepare content parts
-        parts = []
         
-        # Add media if available
-        if media_path and os.path.exists(media_path):
-            try:
-                file_size = os.path.getsize(media_path) / (1024 * 1024)  # MB
-                
-                if media_type == 'image':
-                    print(f"  Including image in Gemini analysis...")
-                    # Read and upload image
-                    with open(media_path, 'rb') as f:
-                        image_bytes = f.read()
-                    
-                    # Add image to parts
-                    parts.append(types.Part.from_bytes(
-                        data=image_bytes,
-                        mime_type=mimetypes.guess_type(media_path)[0] or 'image/jpeg'
-                    ))
-                elif media_type == 'video' and file_size < 20:
-                    print(f"  Including video in Gemini analysis...")
-                    # Upload video file
-                    with open(media_path, 'rb') as f:
-                        video_bytes = f.read()
-                    
-                    parts.append(types.Part.from_bytes(
-                        data=video_bytes,
-                        mime_type='video/mp4'
-                    ))
-            except Exception as e:
-                print(f"  Could not include media in AI analysis: {e}")
+        parts = [types.Part.from_text(text=prompt)]
         
-        # Add text prompt
-        parts.append(types.Part.from_text(text=prompt))
-        
-        # Generate enhanced caption
-        print(f"  Generating enhanced caption with Gemini AI...")
         response = client.models.generate_content(
             model='gemini-2.0-flash-exp',
             contents=parts
@@ -332,241 +214,17 @@ ENHANCED CAPTION (respond with ONLY the enhanced caption, no explanations):"""
         
         if response and response.text:
             enhanced = response.text.strip()
-            # Validate the response
             if len(enhanced) > 50 and len(enhanced) < 2000:
-                print(f"  Caption enhanced successfully!")
                 return enhanced
-            else:
-                print(f"  AI response too short/long, using original")
-                return original_caption
-        else:
-            print(f"  No response from Gemini, using original")
-            return original_caption
+        
+        return original_caption
             
     except Exception as e:
-        print(f"  Gemini AI error: {e}")
         return original_caption
 
 
-def is_repost_or_reply(content, raw_description='', tweet_link=''):
-    """Check if a tweet is a repost, quote tweet, or reply"""
-    if not content:
-        return False
-    
-    # Check for retweet indicators
-    retweet_patterns = [r'^RT\s+@', r'^RT:', r'\bRetweet\b']
-    for pattern in retweet_patterns:
-        if re.search(pattern, content, re.IGNORECASE):
-            return True
-    
-    # Check for reply
-    if re.match(r'^@\w+', content.strip()):
-        return True
-    
-    # Check for quote tweets (links to OTHER tweets)
-    if raw_description:
-        embedded = re.findall(r'https?://(?:x\.com|twitter\.com)/(\w+)/status/(\d+)', raw_description)
-        
-        own_id = None
-        if tweet_link:
-            own_match = re.search(r'/status/(\d+)', tweet_link)
-            if own_match:
-                own_id = own_match.group(1)
-        
-        for username, tweet_id in embedded:
-            if own_id and tweet_id != own_id:
-                return True
-    
-    return False
-
-
-def parse_date(date_str):
-    """Parse RSS date string"""
-    if not date_str:
-        return None
-    try:
-        return parsedate_to_datetime(date_str)
-    except:
-        return None
-
-
-def is_within_time_window(pub_date_str, window_minutes):
-    """Check if date is within window"""
-    pub_date = parse_date(pub_date_str)
-    if not pub_date:
-        return False
-    
-    now = datetime.now(timezone.utc)
-    if pub_date.tzinfo is None:
-        pub_date = pub_date.replace(tzinfo=timezone.utc)
-    
-    return (now - pub_date) <= timedelta(minutes=window_minutes)
-
-
-def extract_image_url(description, media_url=None):
-    """Extract image URL from description or media tag"""
-    if description:
-        matches = re.findall(r'https://pbs\.twimg\.com/media/[A-Za-z0-9_-]+(?:\.[a-zA-Z]+)?(?:\?[^"\s<>]*)?', description)
-        if matches:
-            return matches[0].replace('&amp;', '&')
-    
-    if media_url:
-        return media_url.replace('&amp;', '&')
-    
-    return None
-
-
-def download_image(url):
-    """Download image and return file path"""
-    try:
-        if 'pbs.twimg.com/media/' in url and '?' not in url:
-            url = url + '?format=jpg&name=large'
-        
-        response = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
-        response.raise_for_status()
-        
-        ext = '.jpg'
-        ct = response.headers.get('content-type', '')
-        if 'png' in ct: ext = '.png'
-        elif 'gif' in ct: ext = '.gif'
-        elif 'webp' in ct: ext = '.webp'
-        
-        f = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-        f.write(response.content)
-        f.close()
-        
-        print(f"Image downloaded: {len(response.content)/1024:.1f} KB")
-        return f.name
-    except Exception as e:
-        print(f"Failed to download image: {e}")
-        return None
-
-
-def download_video(tweet_url):
-    """Download video using yt-dlp with improved error handling"""
-    if not HAS_YTDLP:
-        return None, "yt-dlp not installed"
-    
-    try:
-        output = tempfile.mktemp(suffix='')
-        
-        # Improved options for Twitter/X video download
-        opts = {
-            'outtmpl': output + '.%(ext)s',
-            'quiet': False,
-            'no_warnings': False,
-            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
-            'socket_timeout': 60,
-            'retries': 3,
-            'fragment_retries': 3,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            },
-            # Try to use browser cookies for authentication
-            'cookiesfrombrowser': ('chrome',),
-            'nocheckcertificate': True,
-            'ignoreerrors': False,
-            'no_color': True,
-            'merge_output_format': 'mp4',
-        }
-        
-        print(f"  Attempting video download from: {tweet_url}")
-        
-        # First attempt with cookies
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(tweet_url, download=True)
-                if info:
-                    filename = ydl.prepare_filename(info)
-                    # Handle merged files
-                    if not os.path.exists(filename):
-                        # Try with .mp4 extension
-                        mp4_file = output + '.mp4'
-                        if os.path.exists(mp4_file):
-                            filename = mp4_file
-                    
-                    if os.path.exists(filename):
-                        size = os.path.getsize(filename) / (1024*1024)
-                        print(f"  Video downloaded: {size:.1f} MB")
-                        return filename, None
-        except Exception as e1:
-            print(f"  First attempt failed: {e1}")
-            # Try without cookies
-            opts.pop('cookiesfrombrowser', None)
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(tweet_url, download=True)
-                    if info:
-                        filename = ydl.prepare_filename(info)
-                        if not os.path.exists(filename):
-                            mp4_file = output + '.mp4'
-                            if os.path.exists(mp4_file):
-                                filename = mp4_file
-                        
-                        if os.path.exists(filename):
-                            size = os.path.getsize(filename) / (1024*1024)
-                            print(f"  Video downloaded: {size:.1f} MB")
-                            return filename, None
-            except Exception as e2:
-                return None, f"Both attempts failed: {e1}, then {e2}"
-        
-        return None, "File not created after download"
-    except Exception as e:
-        return None, str(e)
-
-
-def check_for_video(tweet_url):
-    """Check if tweet has video"""
-    if not HAS_YTDLP:
-        return False
-    
-    try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-            info = ydl.extract_info(tweet_url, download=False)
-            if info and (info.get('duration') or info.get('ext') in ['mp4', 'mov', 'webm']):
-                return True
-        return False
-    except:
-        return False
-
-
-def fetch_feed(url):
-    """Fetch and parse RSS feed"""
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        root = ET.fromstring(r.text)
-        
-        ns = {'media': 'http://search.yahoo.com/mrss/'}
-        items = []
-        
-        for item in root.findall('.//item'):
-            link = item.find('link')
-            desc = item.find('description')
-            pub = item.find('pubDate')
-            
-            media_url = None
-            media = item.find('media:content', ns)
-            if media is not None:
-                media_url = media.get('url', '').replace('&amp;', '&')
-            
-            if link is not None:
-                items.append({
-                    'link': link.text,
-                    'id': link.text.split('/')[-1] if link.text else '',
-                    'description': desc.text if desc is not None else '',
-                    'pub_date': pub.text if pub is not None else None,
-                    'media_url': media_url
-                })
-        
-        return items
-    except Exception as e:
-        print(f"Failed to fetch feed: {e}")
-        return []
-
-
 def post_to_facebook(page_id, token, message, media_path=None, scheduled_time=None, media_type='text'):
-    """Post to Facebook page"""
+    """Post to Facebook page (synchronous for thread pool)"""
     try:
         if media_path and media_type == 'video':
             url = f"https://graph.facebook.com/v22.0/{page_id}/videos"
@@ -603,11 +261,124 @@ def post_to_facebook(page_id, token, message, media_path=None, scheduled_time=No
         return False, str(e)
 
 
-def main():
-    print("=" * 50)
-    print("Twitter to Facebook Bot")
+async def check_account_parallel(scraper, account_config, state, post_window, min_length):
+    """Check a single account for new tweets (parallel execution)"""
+    if not account_config.get('enabled', True):
+        return None
+    
+    account_id = account_config.get('id', 'unknown')
+    username = account_config.get('username', '').replace('@', '')
+    
+    if not username:
+        return None
+    
+    print(f"Checking: @{username}")
+    
+    try:
+        # Fetch latest tweet using browser
+        tweets = await scraper.get_latest_tweets(username, count=1)
+        
+        if not tweets:
+            print(f"  [{username}] No tweets found")
+            return None
+        
+        latest_tweet = tweets[0]
+        tweet_id = str(latest_tweet['id'])
+        
+        # Skip if not from target username (filters out promoted/sponsored tweets)
+        tweet_user = latest_tweet.get('user', '').lower()
+        if tweet_user != username.lower():
+            print(f"  [{username}] SKIP: Sponsored (from @{tweet_user})")
+            return None
+        
+        # Skip if already posted
+        last_id = state.get('last_posted_ids', {}).get(account_id)
+        if last_id == tweet_id:
+            print(f"  [{username}] Already posted")
+            return None
+        
+        # Check time window
+        tweet_time = latest_tweet['created_at']
+        now = datetime.now(timezone.utc)
+        if tweet_time.tzinfo is None:
+            tweet_time = tweet_time.replace(tzinfo=timezone.utc)
+        
+        age_minutes = (now - tweet_time).total_seconds() / 60
+        if age_minutes > post_window:
+            print(f"  [{username}] Too old ({age_minutes:.0f}min)")
+            return None
+        
+        # Skip retweets and replies
+        if latest_tweet['is_retweet']:
+            print(f"  [{username}] SKIP: Retweet")
+            return None
+        
+        if latest_tweet['is_reply']:
+            print(f"  [{username}] SKIP: Reply")
+            return None
+        
+        # Clean and check message
+        message = clean_text(latest_tweet['text'])
+        
+        if len(message) < min_length:
+            print(f"  [{username}] SKIP: Too short ({len(message)} chars)")
+            return None
+        
+        print(f"  [{username}] OK! Valid tweet ({len(message)} chars)")
+        
+        return {
+            'account_id': account_id,
+            'tweet_id': tweet_id,
+            'message': message,
+            'tweet_url': latest_tweet['url'],
+            'media': latest_tweet['media'],
+            'has_video': latest_tweet['has_video']
+        }
+        
+    except Exception as e:
+        print(f"  [{username}] Error: {e}")
+        return None
+
+
+async def download_media_async(media_url, media_type):
+    """Download media asynchronously"""
+    loop = asyncio.get_event_loop()
+    
+    def download():
+        try:
+            response = requests.get(media_url, timeout=30, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            response.raise_for_status()
+            
+            ext = '.jpg' if media_type == 'image' else '.mp4'
+            if media_type == 'image':
+                ct = response.headers.get('content-type', '')
+                if 'png' in ct:
+                    ext = '.png'
+                elif 'gif' in ct:
+                    ext = '.gif'
+                elif 'webp' in ct:
+                    ext = '.webp'
+            
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+            temp_file.write(response.content)
+            temp_file.close()
+            
+            return temp_file.name
+        except Exception as e:
+            print(f"  [Download Error] {e}")
+            return None
+    
+    return await loop.run_in_executor(None, download)
+
+
+async def main_async():
+    """Main async function - OPTIMIZED FOR SPEED"""
+    print("="*60)
+    print("Twitter to Facebook Bot - PARALLEL OPTIMIZED")
     print(f"Time: {datetime.now().isoformat()}")
-    print("=" * 50)
+    print("="*60)
     
     # Load config and state
     config = load_config()
@@ -619,163 +390,180 @@ def main():
     schedule_gap = settings.get('schedule_gap_minutes', DEFAULT_SCHEDULE_GAP_MINUTES)
     min_length = settings.get('min_content_length', DEFAULT_MIN_CONTENT_LENGTH)
     
-    # Get Facebook credentials - prioritize environment variables (for GitHub Actions)
+    # Get Facebook credentials
     page_id = os.environ.get('FB_PAGE_ID') or config['facebook']['page_id']
     token = os.environ.get('FB_ACCESS_TOKEN') or config['facebook']['access_token']
-    feeds = config.get('feeds', [])
+    
+    # Get Twitter accounts to monitor
+    twitter_accounts = config.get('twitter_accounts', [])
     
     print(f"Settings: window={post_window}min, gap={schedule_gap}min, min_len={min_length}")
     
-    if not feeds:
-        print("No feeds configured!")
+    # **STEP 1: TRY YOUTUBE LIVE STREAMING**
+    print("\n" + "="*60)
+    print("STEP 1: CHECKING YOUTUBE LIVE FOR RE-STREAMING")
+    print("="*60 + "\n")
+    
+    youtube_config = config.get('youtube_restream', {})
+    if youtube_config.get('enabled', False):
+        try:
+            from youtube_facebook_restream_cron import monitor_and_restream_once
+            
+            print("[YouTube] Attempting to start re-streaming...")
+            restream_started = monitor_and_restream_once(config, state)
+            
+            if restream_started:
+                # Re-streaming is running - this will take hours
+                # Save state and exit (Twitter will be checked next run)
+                save_state(state)
+                return
+            else:
+                print("[YouTube] No live stream detected or streaming not started")
+                print("[YouTube] Continuing to Twitter monitoring...")
+        except Exception as e:
+            error_msg = str(e)
+            if 'Permissions error' in error_msg or 'code": 200' in error_msg:
+                print("\n⚠️  FACEBOOK LIVE API ERROR - PAGE NOT YET ELIGIBLE")
+                print("   Your page needs to cross 60 days to use Live Video API")
+                print("   Re-streaming will auto-enable when permissions are granted")
+            else:
+                print(f"\n⚠️  YouTube streaming error: {e}")
+            print("\n   Continuing to Twitter monitoring...\n")
+    else:
+        print("[YouTube] Re-streaming disabled in config")
+        print("[YouTube] Continuing to Twitter monitoring...\n")
+    
+    # **STEP 2: TWITTER MONITORING**
+    print("\n" + "="*60)
+    print("STEP 2: CHECKING TWITTER ACCOUNTS")
+    print("="*60)
+    print(f"Accounts to check: {len(twitter_accounts)}\n")
+    
+    if not twitter_accounts:
+        print("No Twitter accounts configured!")
         return
     
-    # Sort by priority
-    feeds = sorted(feeds, key=lambda f: f.get('priority', 99))
+    # Initialize browser scraper
+    scraper = TwitterBrowserScraper(headless=True)
+    await scraper.start()
     
-    # Collect posts
-    posts = []
+    # Login to Twitter
+    twitter_auth = config.get('twitter_auth', {})
+    twitter_email = os.environ.get('TWITTER_EMAIL') or twitter_auth.get('email')
+    twitter_password = os.environ.get('TWITTER_PASSWORD') or twitter_auth.get('password')
+    twitter_username = os.environ.get('TWITTER_USERNAME') or twitter_auth.get('username')
     
-    for feed in feeds:
-        if not feed.get('enabled', True):
-            continue
-        
-        feed_id = feed.get('id', 'unknown')
-        feed_url = feed.get('url')
-        
-        print(f"\nChecking: {feed_id}")
-        
-        items = fetch_feed(feed_url)
-        if not items:
-            continue
-        
-        latest = items[0]
-        latest_id = latest['id']
-        
-        # Skip if already posted
-        last_id = state.get('last_posted_ids', {}).get(feed_id)
-        if last_id == latest_id:
-            print(f"  Already posted: {latest_id}")
-            continue
-        
-        # Check time window
-        if not is_within_time_window(latest['pub_date'], post_window):
-            print(f"  Too old (>{post_window}min)")
-            continue
-        
-        # Clean and check
-        message = clean_text(latest['description'])
-        print(f"  Length: {len(message)} chars")
-        
-        if len(message) < min_length:
-            print(f"  SKIP: Too short")
-            continue
-        
-        if is_repost_or_reply(message, latest['description'], latest['link']):
-            print(f"  SKIP: Repost/reply")
-            continue
-        
-        # Get media
-        image_url = extract_image_url(latest['description'], latest.get('media_url'))
-        has_video = False
-        
-        if image_url:
-            print(f"  Has image")
+    # Try to load saved session first
+    session_loaded = await scraper.load_session()
+    
+    if not session_loaded and twitter_email and twitter_password:
+        print("\nLogging in to Twitter...")
+        login_success = await scraper.login(twitter_email, twitter_password, twitter_username)
+        if login_success:
+            print("[OK] Logged in!")
         else:
-            print(f"  Checking for video...")
-            has_video = check_for_video(latest['link'])
-            print(f"  Has video: {has_video}")
-        
-        posts.append({
-            'feed_id': feed_id,
-            'item_id': latest_id,
-            'message': message,
-            'image_url': image_url,
-            'tweet_url': latest['link'],
-            'has_video': has_video
-        })
+            print("[WARNING] Login failed - using guest mode")
+    elif session_loaded:
+        print("[OK] Using saved session")
+    else:
+        print("[WARNING] No credentials - using guest mode")
     
-    print(f"\n{'='*50}")
-    print(f"Posts to make: {len(posts)}")
-    print("=" * 50)
+    # **PARALLEL EXECUTION: Check all accounts concurrently**
+    print(f"\n{'='*60}")
+    print(f"CHECKING ALL {len(twitter_accounts)} ACCOUNTS IN PARALLEL...")
+    print(f"{'='*60}\n")
+    
+    tasks = [
+        check_account_parallel(scraper, account_config, state, post_window, min_length)
+        for account_config in twitter_accounts
+    ]
+    
+    # Run all checks concurrently
+    results = await asyncio.gather(*tasks)
+    
+    # Filter out None results
+    posts = [post for post in results if post is not None]
+    
+    await scraper.close()
+    
+    print(f"\n{'='*60}")
+    print(f"Found {len(posts)} posts to publish")
+    print(f"{'='*60}\n")
     
     if not posts:
         save_state(state)
         return
     
-    # Post them
+    # Post them with thread pool for parallel FB posting
     base_time = datetime.now(timezone.utc)
     
-    for i, post in enumerate(posts):
-        feed_id = post['feed_id']
-        message = post['message']
-        
-        print(f"\n{'─'*40}")
-        print(f"Processing: {feed_id}")
-        print(f"{'─'*40}")
-        
-        # STEP 1: Download media FIRST (needed for AI analysis)
-        media_path = None
-        media_type = 'text'
-        
-        if post.get('image_url'):
-            print(f"Step 1: Downloading image...")
-            media_path = download_image(post['image_url'])
-            if media_path:
-                media_type = 'image'
-                print(f"  ✓ Image downloaded")
-        elif post.get('has_video'):
-            print(f"Step 1: Downloading video...")
-            media_path, err = download_video(post['tweet_url'])
-            if media_path:
-                media_type = 'video'
-                print(f"  ✓ Video downloaded")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        for i, post in enumerate(posts):
+            account_id = post['account_id']
+            message = post['message']
+            
+            print(f"\nProcessing {i+1}/{len(posts)}: {account_id}")
+            
+            # STEP 1: Download media (async)
+            media_path = None
+            media_type = 'text'
+            
+            if post.get('media'):
+                images = [m for m in post['media'] if m['type'] == 'image']
+                if images:
+                    print(f"  Downloading image...")
+                    media_path = await download_media_async(images[0]['url'], 'image')
+                    if media_path:
+                        media_type = 'image'
+                        print(f"  [OK] Image downloaded")
+            
+            # STEP 2: Enhance caption (in thread pool)
+            print(f"  Enhancing caption...")
+            loop = asyncio.get_event_loop()
+            enhanced_message = await loop.run_in_executor(
+                executor,
+                enhance_caption_with_gemini,
+                message, media_path, media_type
+            )
+            
+            # STEP 3: Generate SEO hashtags
+            hashtags = generate_seo_hashtags(content=enhanced_message, max_hashtags=10)
+            
+            # STEP 4: Format final message
+            final_message = format_post_with_hashtags(enhanced_message, hashtags)
+            
+            # STEP 5: Post to Facebook (in thread pool)
+            sched = None
+            if i > 0:
+                sched_dt = base_time + timedelta(minutes=schedule_gap * i)
+                sched = int(sched_dt.timestamp())
+            
+            print(f"  Posting to Facebook...")
+            success, result = await loop.run_in_executor(
+                executor,
+                post_to_facebook,
+                page_id, token, final_message, media_path, sched, media_type
+            )
+            
+            # Cleanup
+            if media_path and os.path.exists(media_path):
+                os.remove(media_path)
+            
+            if success:
+                status = 'SCHEDULED' if i > 0 else 'POSTED'
+                print(f"  [SUCCESS] {status}: {result}")
+                state.setdefault('last_posted_ids', {})[account_id] = post['tweet_id']
             else:
-                print(f"  ✗ Video failed: {err}")
-        else:
-            print(f"Step 1: No media to download")
-        
-        # STEP 2: Enhance caption with Gemini AI (using media for context)
-        print(f"Step 2: Enhancing caption with Gemini AI...")
-        enhanced_message = enhance_caption_with_gemini(
-            original_caption=message,
-            media_path=media_path,
-            media_type=media_type
-        )
-        
-        # STEP 3: Generate SEO hashtags
-        print(f"Step 3: Generating SEO hashtags...")
-        hashtags = generate_seo_hashtags(content=enhanced_message, max_hashtags=10)
-        print(f"  Hashtags: {' '.join(hashtags[:5])}...")
-        
-        # STEP 4: Format final message with hashtags
-        final_message = format_post_with_hashtags(enhanced_message, hashtags)
-        
-        # STEP 5: Post to Facebook
-        sched = None
-        if i == 0:
-            print(f"Step 4: Posting immediately ({media_type})...")
-        else:
-            sched_dt = base_time + timedelta(minutes=schedule_gap * i)
-            sched = int(sched_dt.timestamp())
-            print(f"Step 4: Scheduling for {sched_dt.strftime('%H:%M')} ({media_type})...")
-        
-        success, result = post_to_facebook(page_id, token, final_message, media_path, sched, media_type)
-        
-        # Cleanup
-        if media_path and os.path.exists(media_path):
-            os.remove(media_path)
-        
-        if success:
-            status = 'SCHEDULED' if i > 0 else 'POSTED'
-            print(f"SUCCESS! {status}: {result}")
-            state.setdefault('last_posted_ids', {})[feed_id] = post['item_id']
-        else:
-            print(f"FAILED: {result}")
+                print(f"  [FAILED] {result}")
     
     # Save state
     save_state(state)
     print("\nDone!")
+
+
+def main():
+    """Main entry point"""
+    asyncio.run(main_async())
 
 
 if __name__ == '__main__':
