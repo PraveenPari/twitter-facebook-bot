@@ -156,8 +156,8 @@ class TwitterBrowserScraper:
             url = f"https://twitter.com/{username}"
             print(f"  [Browser] Navigating to @{username}...")
             
-            # Navigate and WAIT for full page load (DOM + network)
-            await self.page.goto(url, wait_until='networkidle', timeout=30000)
+            # Navigate and WAIT for page load (DOM fully parsed and resources loaded)
+            await self.page.goto(url, wait_until='load', timeout=30000)
             
             # Wait for content (increased to ensure full load)
             print(f"  [Browser] Waiting for content...")
