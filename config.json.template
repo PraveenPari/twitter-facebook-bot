@@ -1,0 +1,31 @@
+{
+  "twitter_accounts": [
+    { "id": "tvk_vijay_main", "username": "TVKVijayHQ", "url": "https://nitter.net/TVKVijayHQ" },
+    { "id": "tvk_party_hq", "username": "TVKPartyHQ", "url": "https://nitter.net/TVKPartyHQ" },
+    { "id": "tvk_it_wing", "username": "TVKHQITWingOffl", "url": "https://nitter.net/TVKHQITWingOffl" },
+    { "id": "arun_raaj", "username": "arunraajkg", "url": "https://nitter.net/arunraajkg" },
+    { "id": "ashwin_tvk", "username": "ashwin_tvk_", "url": "https://nitter.net/ashwin_tvk_" },
+    { "id": "tvk_vijay_24x7", "username": "TVKVijay24x7", "url": "https://nitter.net/TVKVijay24x7" },
+    { "id": "boss_tvk", "username": "BossTVK", "url": "https://nitter.net/BossTVK" },
+    { "id": "tvk_world", "username": "TVK_WORLD", "url": "https://nitter.net/TVK_WORLD" },
+    { "id": "jegadesh_tvk", "username": "JegadeshTVK", "url": "https://nitter.net/JegadeshTVK" },
+    { "id": "priyanka_smile", "username": "PriyankaSmile01", "url": "https://nitter.net/PriyankaSmile01" },
+    { "id": "vijay_fans_trends", "username": "VijayFansTrends", "url": "https://nitter.net/VijayFansTrends" },
+    { "id": "sangeet", "username": "sangeet29332013", "url": "https://nitter.net/sangeet29332013" }
+  ],
+  "facebook": {
+    "page_id": "YOUR_FB_PAGE_ID",
+    "access_token": "YOUR_FB_ACCESS_TOKEN"
+  },
+  "settings": {
+    "post_window_minutes": 30,
+    "schedule_gap_minutes": 10,
+    "min_content_length": 5
+  },
+  "youtube_restream": {
+    "enabled": true,
+    "channels": [
+      "https://www.youtube.com/@TVKVijayHQ"
+    ]
+  }
+}
