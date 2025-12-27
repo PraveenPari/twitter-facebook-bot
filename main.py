@@ -13,7 +13,24 @@ import time
 from datetime import datetime, timedelta, timezone
 
 # 3rd party
+import requests
+import yt_dlp
+from playwright.async_api import async_playwright
 import logging
+
+try:
+    from google import genai
+    from google.genai import types
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+
+# Import YouTube monitor
+try:
+    import youtube_live_monitor
+    HAS_YOUTUBE = True
+except ImportError:
+    HAS_YOUTUBE = False
 
 # Configure Logging
 logging.basicConfig(
@@ -26,7 +43,52 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ... (imports) ...
+def load_config():
+    if os.path.exists('config.json'):
+        with open('config.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    config_str = os.environ.get('CONFIG_JSON')
+    if config_str:
+        return json.loads(config_str)
+    raise Exception("No config found!")
+
+def load_state():
+    if os.path.exists('state.json'):
+        try:
+            with open('state.json', 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    return {'last_posted_ids': {}}
+
+def save_state(state):
+    with open('state.json', 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2)
+
+def clean_text(text):
+    if not text: return ''
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'^(@\w+\s*)+', '', text)
+    text = re.sub(r' +', ' ', text)
+    return text.strip()
+
+# TVK Hashtags (Shortened)
+TVK_HASHTAGS = ["#TVK", "#ThamizhagaVetriKazhagam", "#ThalapathyVijay", "#TamilNadu"]
+
+def generate_hashtags(content):
+    tags = TVK_HASHTAGS.copy()
+    if 'election' in content.lower(): tags.append("#TNElection2026")
+    return tags[:10]
+
+def enhance_caption(caption, api_key):
+    if not HAS_GEMINI or not api_key: return caption
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = f"Enhance this Tamil political caption for Facebook (TVK party, Vijay). Positive, inspiring. Max 300 chars. Caption: {caption}"
+        resp = client.models.generate_content(model='gemini-2.0-flash-exp', contents=prompt)
+        return resp.text.strip() if resp.text else caption
+    except:
+        return caption
 
 async def scrape_nitter_user_playwright(username, browser):
     """Scrape nitter.net using Playwright"""
