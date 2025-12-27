@@ -22,17 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests yt-dlp google-genai playwright
-      
-      - name: Install FFmpeg for YouTube streaming
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-      
-      - name: Install Playwright browsers
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
+          pip install requests yt-dlp google-genai
       
       - name: Download state from Gist
         env:
@@ -51,7 +41,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: |
-          # Create config from secret (contains twitter_accounts and twitter_auth)
+          # Create config from secret
           echo "$CONFIG_JSON" > config.json
           
           # Run the bot
