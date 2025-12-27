@@ -137,7 +137,7 @@ async def scrape_nitter_user_tab(username, context):
                     logger.error(f"[{username}] Timeline failed on {instance}")
                     continue
                 
-                logger.info(f"[{username}] ✅ Success!")
+                logger.info(f"[{username}] [OK] Loaded")
                 
                 items = await page.query_selector_all('.timeline-item')
                 logger.info(f"[{username}] Found {len(items)} items")
@@ -154,13 +154,21 @@ async def scrape_nitter_user_tab(username, context):
                     media_url = None
                     has_video = False
                     
+                    # Check for video first (multiple methods)
+                    vid_el = await item.query_selector('.attachments video')
+                    gallery_vid = await item.query_selector('.gallery-video')
+                    if vid_el or gallery_vid: 
+                        has_video = True
+                    
+                    # Get image/thumbnail
                     img_el = await item.query_selector('.attachments img')
                     if img_el:
                         src = await img_el.get_attribute('src')
-                        if src: media_url = f"{instance}{src}"
-                    
-                    vid_el = await item.query_selector('.attachments video')
-                    if vid_el: has_video = True
+                        if src: 
+                            media_url = f"{instance}{src}"
+                            # If URL contains video_thumb, it's actually a video
+                            if 'video_thumb' in src or 'ext_tw_video' in src:
+                                has_video = True
                     
                     # Extract Timestamp
                     date_str = ""
@@ -318,21 +326,36 @@ async def main_async():
                 if username == 'rss': username = acc['url'].strip('/').split('/')[-2]
             usernames.append(username)
         
-        # Scrape ALL accounts in PARALLEL using tabs
+        # Scrape in BATCHES of 3 to avoid rate limiting
         async def scrape_in_tab(username, context):
             if not username:
                 return []
             return await scrape_nitter_user_tab(username, context)
         
-        logger.info(f"🚀 Scraping {len(usernames)} accounts in parallel...")
-        tasks = [scrape_in_tab(u, context) for u in usernames]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        BATCH_SIZE = 3
+        results = []
         
-        # Handle exceptions
-        for i, r in enumerate(results):
-            if isinstance(r, Exception):
-                logger.error(f"Error scraping {usernames[i]}: {r}")
-                results[i] = []
+        for batch_start in range(0, len(usernames), BATCH_SIZE):
+            batch = usernames[batch_start:batch_start + BATCH_SIZE]
+            logger.info(f"[BATCH] Scraping {len(batch)} accounts: {batch}")
+            
+            tasks = [scrape_in_tab(u, context) for u in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for i, r in enumerate(batch_results):
+                if isinstance(r, Exception):
+                    logger.error(f"[ERROR] {batch[i]}: {r}")
+                    results.append([])
+                else:
+                    results.append(r)
+            
+            # Wait between batches to avoid rate limit
+            if batch_start + BATCH_SIZE < len(usernames):
+                logger.info("[BATCH] Waiting 2s before next batch...")
+                await asyncio.sleep(2)
+        
+        success_count = sum(1 for r in results if r)
+        logger.info(f"[DONE] Loaded {success_count}/{len(usernames)} accounts successfully")
         
         await context.close()
         await browser.close()
@@ -340,73 +363,69 @@ async def main_async():
     # Process results
     posts_to_make = []
     for i, tweets in enumerate(results):
-        if not tweets: continue
-        
         # Use account 'id' for state key
         acc = accounts[i]
         feed_id = acc.get('id', acc.get('username', 'unknown'))
         
-        # Find the BEST tweet (skip pinned, skip already posted, skip old)
-        best_tweet = None
+        if not tweets:
+            logger.warning(f"[{feed_id}] No tweets fetched (scrape failed or empty)")
+            continue
+        
+        # Find posts within 1 hour and log them
+        posts_within_hour = []
         for tweet in tweets:
             tweet_id = tweet['id']
             
-            # Skip if pinned (often old)
+            # Skip pinned
             if tweet.get('is_pinned'):
-                logger.info(f"[{feed_id}] Skipping pinned tweet {tweet_id}")
                 continue
             
-            # Skip if already posted
+            # Skip already posted
             if state.get('last_posted_ids', {}).get(feed_id) == tweet_id:
-                logger.info(f"[{feed_id}] Already posted {tweet_id}")
                 continue
             
-            # Skip if no media
+            # Skip no media
             if not tweet.get('has_video') and not tweet.get('media_url'):
-                logger.info(f"[{feed_id}] Skipping {tweet_id}: text-only (no media)")
                 continue
                 
-            # Check Time (Strict 30 mins)
+            # Check Time (1 hour = 3600 seconds)
             is_old = False
+            age_str = "unknown"
             if 'date_str' in tweet and tweet['date_str']:
                 try:
                     d_str = tweet['date_str'].replace('UTC', '').strip()
                     post_time = datetime.strptime(d_str, "%b %d, %Y · %I:%M %p")
                     post_time = post_time.replace(tzinfo=timezone.utc)
-                    
                     now = datetime.now(timezone.utc)
                     age = now - post_time
+                    age_str = str(age).split('.')[0]  # Remove microseconds
                     
-                    if age.total_seconds() > 1800: # 30 mins
-                        logger.info(f"[{feed_id}] Tweet {tweet_id} too old ({age})")
+                    if age.total_seconds() > 3600:  # 1 hour
                         is_old = True
-                    else:
-                        logger.info(f"[{feed_id}] Fresh tweet {tweet_id} (Age: {age})")
-                except Exception as e:
-                    # Parsing failed = likely relative time like "6m" = FRESH
-                    logger.info(f"[{feed_id}] Tweet {tweet_id} date='{tweet['date_str']}' (Assuming FRESH)")
+                except:
+                    age_str = tweet['date_str']  # Use raw date if parsing fails
             
-            if is_old:
-                continue
-                
-            # Found a valid tweet!
-            best_tweet = tweet
-            break  # Take the first valid one
+            if not is_old:
+                media_type = "VIDEO" if tweet.get('has_video') else "IMAGE"
+                posts_within_hour.append({
+                    'id': tweet_id,
+                    'type': media_type,
+                    'age': age_str
+                })
         
-        if not best_tweet:
-            logger.info(f"[{feed_id}] No valid tweets found")
-            continue
+        # Log posts within 1 hour for this account
+        if posts_within_hour:
+            for p in posts_within_hour:
+                logger.info(f"[FOUND] [{feed_id}] {p['type']} {p['id']} (Age: {p['age']})")
             
-        # Log what we found
-        if best_tweet.get('has_video'):
-            logger.info(f"✅ Found VIDEO to post for {feed_id}")
-        else:
-            logger.info(f"✅ Found IMAGE to post for {feed_id}")
-                
-        posts_to_make.append({
-            'feed_id': feed_id,
-            'tweet': best_tweet
-        })
+            # Take the first one (newest)
+            best = posts_within_hour[0]
+            best_tweet = next(t for t in tweets if t['id'] == best['id'])
+            
+            posts_to_make.append({
+                'feed_id': feed_id,
+                'tweet': best_tweet
+            })
             
     logger.info(f"Found {len(posts_to_make)} new posts with media.")
     
@@ -414,8 +433,8 @@ async def main_async():
     video_posts = [p for p in posts_to_make if p['tweet'].get('has_video')]
     image_posts = [p for p in posts_to_make if not p['tweet'].get('has_video')]
     
-    logger.info(f"📹 Videos to post immediately: {len(video_posts)}")
-    logger.info(f"🖼️ Images to schedule: {len(image_posts)}")
+    logger.info(f"[VIDEOS] To post: {len(video_posts)}")
+    logger.info(f"[IMAGES] To post: {len(image_posts)}")
     
     # 3. Post to Facebook
     page_id = os.environ.get('FB_PAGE_ID') or config['facebook']['page_id']
@@ -428,7 +447,7 @@ async def main_async():
     
     # Post VIDEOS first (immediate)
     for item in video_posts:
-        logger.info(f"🎬 Posting VIDEO for {item['feed_id']}...")
+        logger.info(f"[POST] VIDEO for {item['feed_id']}...")
         tweet = item['tweet']
         
         media_path = download_media(tweet['link'], is_video=True)
@@ -449,11 +468,11 @@ async def main_async():
         if 'id' in res or 'post_id' in res:
             state['last_posted_ids'][item['feed_id']] = tweet['id']
             save_state(state)
-            logger.info(f"✅ VIDEO posted successfully for {item['feed_id']}")
+            logger.info(f"[OK] VIDEO posted for {item['feed_id']}")
     
     # Post IMAGES (also immediate, after videos)
     for item in image_posts:
-        logger.info(f"📷 Posting IMAGE for {item['feed_id']}...")
+        logger.info(f"[POST] IMAGE for {item['feed_id']}...")
         tweet = item['tweet']
         
         media_path = download_media(tweet['media_url'], is_video=False)
@@ -474,7 +493,7 @@ async def main_async():
         if 'id' in res or 'post_id' in res:
             state['last_posted_ids'][item['feed_id']] = tweet['id']
             save_state(state)
-            logger.info(f"✅ IMAGE posted successfully for {item['feed_id']}")
+            logger.info(f"[OK] IMAGE posted for {item['feed_id']}")
             
     # Save Reports
     run_timestamp = datetime.now().isoformat()
