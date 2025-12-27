@@ -373,6 +373,39 @@ async def download_media_async(media_url, media_type):
     return await loop.run_in_executor(None, download)
 
 
+def download_video(tweet_url):
+    """Download video from tweet using yt-dlp"""
+    if not HAS_YTDLP:
+        return None
+    
+    try:
+        temp_dir = tempfile.gettempdir()
+        output_template = os.path.join(temp_dir, '%(id)s.%(ext)s')
+        
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(tweet_url, download=True)
+            if info:
+                video_id = info.get('id', 'video')
+                # Try to find the downloaded file
+                for ext in ['mp4', 'webm', 'mkv']:
+                    video_path = os.path.join(temp_dir, f"{video_id}.{ext}")
+                    if os.path.exists(video_path):
+                        return video_path
+        
+        return None
+    except Exception as e:
+        print(f"  [Video Download Error] {e}")
+        return None
+
+
 async def main_async():
     """Main async function - OPTIMIZED FOR SPEED"""
     print("="*60)
@@ -588,6 +621,22 @@ async def main_async():
                     if media_path:
                         media_type = 'image'
                         print(f"  [OK] Image downloaded")
+            
+            # Try to download video if no images and has_video flag is set
+            if not media_path and post.get('has_video') and HAS_YTDLP:
+                print(f"  Downloading video...")
+                loop = asyncio.get_event_loop()
+                video_path = await loop.run_in_executor(
+                    executor,
+                    download_video,
+                    post['tweet_url']
+                )
+                if video_path:
+                    media_path = video_path
+                    media_type = 'video'
+                    print(f"  [OK] Video downloaded")
+                else:
+                    print(f"  [WARNING] Video download failed")
             
             # STEP 2: Enhance caption (in thread pool)
             print(f"  Enhancing caption...")
