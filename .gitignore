@@ -55,3 +55,10 @@ tmp/
 
 # Batch scripts (Windows specific)
 *.bat
+
+# Debug Artifacts
+debug_videos/
+debug_shot_*.png
+run_report.json
+cucumber_report.json
+*.webm

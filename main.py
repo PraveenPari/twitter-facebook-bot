@@ -53,13 +53,21 @@ def load_config():
     raise Exception("No config found!")
 
 def load_state():
+    state = {'last_posted_ids': {}}
     if os.path.exists('state.json'):
         try:
             with open('state.json', 'r', encoding='utf-8') as f:
-                return json.load(f)
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    # Merge loaded into default, or just ensure key exists
+                    if 'last_posted_ids' in loaded:
+                        return loaded
+                    else:
+                        loaded['last_posted_ids'] = {}
+                        return loaded
         except:
             pass
-    return {'last_posted_ids': {}}
+    return state
 
 def save_state(state):
     with open('state.json', 'w', encoding='utf-8') as f:
@@ -185,13 +193,21 @@ async def scrape_nitter_user_playwright_context(username, browser):
                     vid_el = await item.query_selector('.attachments video')
                     if vid_el: has_video = True
                     
+                    # Extract Timestamp we need for 30m check
+                    date_str = ""
+                    date_el = await item.query_selector('.tweet-date a')
+                    if date_el:
+                        date_str = await date_el.get_attribute('title') 
+                        # format often: "Dec 27, 2025 · 3:30 PM UTC"
+
                     if tweet_id:
                         tweets.append({
                             'id': tweet_id,
                             'text': text,
                             'link': full_link,
                             'media_url': media_url,
-                            'has_video': has_video
+                            'has_video': has_video,
+                            'date_str': date_str
                         })
                 
                 break 
@@ -370,6 +386,27 @@ async def main_async():
         if state.get('last_posted_ids', {}).get(feed_id) == latest['id']:
             continue
             
+        # Check Time (Strict 30 mins)
+        if 'date_str' in latest and latest['date_str']:
+            try:
+                # Format: "Dec 27, 2025 · 3:30 PM UTC"
+                # Remove UTC for parsing, treat as UTC
+                d_str = latest['date_str'].replace('UTC', '').strip()
+                # Need to be flexible with format if needed, but start strict
+                post_time = datetime.strptime(d_str, "%b %d, %Y · %I:%M %p")
+                post_time = post_time.replace(tzinfo=timezone.utc)
+                
+                now = datetime.now(timezone.utc)
+                age = now - post_time
+                
+                if age.total_seconds() > 1800: # 30 * 60 = 1800
+                    logger.info(f"Skipping {feed_id}: Post too old ({age})")
+                    continue
+                else:
+                    logger.info(f"Fresh post found for {feed_id} (Age: {age})")
+            except Exception as e:
+                logger.warning(f"Could not parse date '{latest['date_str']}': {e}. Posting anyway to be safe.")
+                
         posts_to_make.append({
             'feed_id': feed_id,
             'tweet': latest
