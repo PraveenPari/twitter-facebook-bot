@@ -84,7 +84,7 @@
         "_note": "Tries to re-stream to Facebook Live. If fails (60-day error), continues to Twitter"
     },
     "settings": {
-        "post_window_minutes": 60,
+        "post_window_minutes": 1440,
         "schedule_gap_minutes": 10,
         "min_content_length": 50
     }

@@ -470,11 +470,11 @@ async def main_async():
     
     # **PARALLEL EXECUTION: Check accounts in batches to avoid rate limiting**
     print(f"\n{'='*60}")
-    print(f"CHECKING ALL {len(twitter_accounts)} ACCOUNTS (3 at a time)...")
+    print(f"CHECKING ALL {len(twitter_accounts)} ACCOUNTS (2 at a time)...")
     print(f"{'='*60}\n")
     
     posts = []
-    batch_size = 3  # Check 3 accounts at a time to avoid Twitter blocking
+    batch_size = 2  # Check 2 accounts at a time to avoid Twitter blocking
     
     for i in range(0, len(twitter_accounts), batch_size):
         batch = twitter_accounts[i:i+batch_size]
