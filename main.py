@@ -97,29 +97,49 @@ async def scrape_nitter_user_playwright(username, browser):
     
     tweets = []
     page = await browser.new_page()
-    try:
-        # 1. Navigation with improved waiting
+    
+    # Retry logic for slow pages
+    MAX_RETRIES = 2
+    for attempt in range(MAX_RETRIES):
         try:
-            logger.info(f"[{username}] Waiting for page load (timeout=90s)...")
-            await page.goto(url, timeout=90000, wait_until='domcontentloaded') # loosen to domcontentloaded to avoid hanging on stray requests
+            logger.info(f"[{username}] Attempt {attempt+1}/{MAX_RETRIES}: Waiting for page load (timeout=120s)...")
+            
+            # Wait for 'domcontentloaded' is usually enough for content, but we wait long
+            await page.goto(url, timeout=120000, wait_until='domcontentloaded') 
             
             # Check for specific error text first
             content = await page.content()
             if "Rate limit exceeded" in content or "Instance has been rate limited" in content:
                  logger.error(f"[{username}] Nitter Rate Limit detected!")
+                 if attempt < MAX_RETRIES - 1:
+                     await asyncio.sleep(10)
+                     continue
                  return []
             
-            await page.wait_for_selector('.timeline-item', timeout=60000) # Increased to 60s
-            logger.info(f"[{username}] Page loaded successfully")
+            # Wait for timeline strictly
+            logger.info(f"[{username}] Waiting for timeline selector...")
+            await page.wait_for_selector('.timeline-item', timeout=60000)
+            
+            logger.info(f"[{username}] Page & Timeline loaded successfully")
+            break # Success, exit retry loop
+            
         except Exception as e:
             # Enhanced debugging
-            try:
-                title = await page.title()
-                logger.error(f"[{username}] Navigation failed: {str(e)[:200]} | Page Title: {title}")
-            except:
-                logger.error(f"[{username}] Navigation failed: {str(e)[:200]}")
-            return []
+            title = "Unknown"
+            try: title = await page.title()
+            except: pass
+            
+            logger.error(f"[{username}] Attempt {attempt+1} failed: {str(e)[:200]} | Page Title: {title}")
+            
+            if attempt < MAX_RETRIES - 1:
+                logger.info(f"[{username}] Retrying in 5 seconds...")
+                await asyncio.sleep(5)
+            else:
+                logger.error(f"[{username}] Gave up after {MAX_RETRIES} attempts.")
+                await page.close()
+                return []
 
+    try:
         # 2. Scrape Items
         items = await page.query_selector_all('.timeline-item')
         logger.info(f"[{username}] Found {len(items)} items on timeline")
