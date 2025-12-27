@@ -91,17 +91,15 @@ async def scrape_nitter_user_playwright(username, browser):
     tweets = []
     page = await browser.new_page()
     try:
-        await page.goto(url, timeout=30000, wait_until='domcontentloaded')
-        
-        # Wait for timeline
+        # 1. Navigation with improved waiting
         try:
-            await page.wait_for_selector('.timeline-item', timeout=10000)
-        except:
-            print(f"  [Playwright] Timeout waiting for timeline on {url}")
-            await page.close()
+            await page.goto(url, timeout=90000, wait_until='networkidle')
+            await page.wait_for_selector('.timeline-item', timeout=20000)
+        except Exception as e:
+            print(f"  [Playwright] Navigation failed on {url}: {str(e)[:100]}")
             return []
 
-        # Get tweet elements
+        # 2. Scrape Items
         items = await page.query_selector_all('.timeline-item')
         
         for item in items[:5]: # Check top 5
@@ -126,8 +124,6 @@ async def scrape_nitter_user_playwright(username, browser):
             
             vid_el = await item.query_selector('.attachments video')
             if vid_el: has_video = True
-            
-            # Skip pinned? (check for pinned icon if needed, ignoring for now)
             
             if tweet_id:
                 tweets.append({
@@ -218,8 +214,8 @@ async def main_async():
         
         accounts = config.get('feeds', []) or config.get('twitter_accounts', [])
         
-        # Parallel scraping 
-        tasks = []
+        # Sequential scraping for stability
+        results = []
         for acc in accounts:
             username = acc.get('username')
             # Extract username if missing
@@ -228,9 +224,15 @@ async def main_async():
                 if username == 'rss': username = acc['url'].strip('/').split('/')[-2]
             
             if username:
-                tasks.append(scrape_nitter_user_playwright(username, browser))
+                # Process one by one
+                tweets = await scrape_nitter_user_playwright(username, browser)
+                results.append(tweets)
+                # Small delay between checks
+                await asyncio.sleep(2)
+            else:
+                results.append([]) # Placeholder for failed/skipped
             
-        results = await asyncio.gather(*tasks)
+        # results = await asyncio.gather(*tasks) -> Removed parallel execution
         
         # Process results
         posts_to_make = []
