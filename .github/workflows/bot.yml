@@ -51,6 +51,17 @@ jobs:
           
           # Run the bot
           python main.py
+
+      - name: Upload Debug Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            bot_run.log
+            debug_shot_*.png
+            debug_videos/
+            state.json
       
       - name: Upload state to Gist
         if: always()
