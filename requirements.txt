@@ -1,3 +1,5 @@
 requests
 yt-dlp
 google-genai
+playwright
+beautifulsoup4
