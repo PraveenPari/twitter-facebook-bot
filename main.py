@@ -433,8 +433,10 @@ async def main_async():
     video_posts = [p for p in posts_to_make if p['tweet'].get('has_video')]
     image_posts = [p for p in posts_to_make if not p['tweet'].get('has_video')]
     
-    logger.info(f"[VIDEOS] To post: {len(video_posts)}")
-    logger.info(f"[IMAGES] To post: {len(image_posts)}")
+    # Combine: Videos first (priority), then images
+    all_posts = video_posts + image_posts
+    
+    logger.info(f"[QUEUE] {len(video_posts)} videos + {len(image_posts)} images = {len(all_posts)} total")
     
     # 3. Post to Facebook
     page_id = os.environ.get('FB_PAGE_ID') or config['facebook']['page_id']
@@ -445,55 +447,51 @@ async def main_async():
     
     post_stats = []
     
-    # Post VIDEOS first (immediate)
-    for item in video_posts:
-        logger.info(f"[POST] VIDEO for {item['feed_id']}...")
+    for i, item in enumerate(all_posts):
         tweet = item['tweet']
+        is_video = tweet.get('has_video', False)
+        media_type = "VIDEO" if is_video else "IMAGE"
         
-        media_path = download_media(tweet['link'], is_video=True)
+        # First post = immediate, rest = scheduled at 10-min intervals
+        if i == 0:
+            is_scheduled = False
+            sched_time = None
+            logger.info(f"[NOW] Posting {media_type} for {item['feed_id']}...")
+        else:
+            is_scheduled = True
+            sched_time = base_time + (i * 600)  # 10 min intervals
+            mins = i * 10
+            logger.info(f"[SCHEDULE +{mins}min] {media_type} for {item['feed_id']}...")
+        
+        # Download media
+        if is_video:
+            media_path = download_media(tweet['link'], is_video=True)
+        else:
+            media_path = download_media(tweet['media_url'], is_video=False)
+            
         if not media_path:
-            logger.error(f"Failed to download video for {item['feed_id']}")
-            post_stats.append({'id': item['feed_id'], 'type': 'video', 'status': 'failed', 'error': 'download_failed'})
+            logger.error(f"Failed to download {media_type} for {item['feed_id']}")
+            post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'status': 'failed', 'error': 'download_failed'})
             continue
         
+        # Enhance caption
         msg = clean_text(tweet['text'])
         logger.info("Enhancing caption...")
         msg = enhance_caption(msg, gemini_key)
         tags = generate_hashtags(msg)
         final_msg = f"{msg}\n\n{' '.join(tags)}"
         
-        res = post_facebook(page_id, token, final_msg, media_path, is_video=True, is_sched=False, sched_time=None)
-        post_stats.append({'id': item['feed_id'], 'type': 'video', 'status': 'success' if 'id' in res or 'post_id' in res else 'failed', 'error': res.get('error')})
+        # Post to Facebook
+        res = post_facebook(page_id, token, final_msg, media_path, is_video=is_video, is_sched=is_scheduled, sched_time=sched_time)
+        post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'status': 'success' if 'id' in res or 'post_id' in res else 'failed', 'error': res.get('error')})
         
         if 'id' in res or 'post_id' in res:
             state['last_posted_ids'][item['feed_id']] = tweet['id']
             save_state(state)
-            logger.info(f"[OK] VIDEO posted for {item['feed_id']}")
-    
-    # Post IMAGES (also immediate, after videos)
-    for item in image_posts:
-        logger.info(f"[POST] IMAGE for {item['feed_id']}...")
-        tweet = item['tweet']
-        
-        media_path = download_media(tweet['media_url'], is_video=False)
-        if not media_path:
-            logger.error(f"Failed to download image for {item['feed_id']}")
-            post_stats.append({'id': item['feed_id'], 'type': 'image', 'status': 'failed', 'error': 'download_failed'})
-            continue
-        
-        msg = clean_text(tweet['text'])
-        logger.info("Enhancing caption...")
-        msg = enhance_caption(msg, gemini_key)
-        tags = generate_hashtags(msg)
-        final_msg = f"{msg}\n\n{' '.join(tags)}"
-        
-        res = post_facebook(page_id, token, final_msg, media_path, is_video=False, is_sched=False, sched_time=None)
-        post_stats.append({'id': item['feed_id'], 'type': 'image', 'status': 'success' if 'id' in res or 'post_id' in res else 'failed', 'error': res.get('error')})
-        
-        if 'id' in res or 'post_id' in res:
-            state['last_posted_ids'][item['feed_id']] = tweet['id']
-            save_state(state)
-            logger.info(f"[OK] IMAGE posted for {item['feed_id']}")
+            if is_scheduled:
+                logger.info(f"[OK] {media_type} scheduled for {item['feed_id']}")
+            else:
+                logger.info(f"[OK] {media_type} posted for {item['feed_id']}")
             
     # Save Reports
     run_timestamp = datetime.now().isoformat()
