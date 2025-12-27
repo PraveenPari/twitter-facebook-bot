@@ -384,28 +384,34 @@ async def main_async():
         
         # Check if posted
         if state.get('last_posted_ids', {}).get(feed_id) == latest['id']:
+            logger.info(f"Skipping {feed_id}: Already posted {latest['id']}")
             continue
             
         # Check Time (Strict 30 mins)
+        should_skip = False
         if 'date_str' in latest and latest['date_str']:
             try:
                 # Format: "Dec 27, 2025 · 3:30 PM UTC"
-                # Remove UTC for parsing, treat as UTC
                 d_str = latest['date_str'].replace('UTC', '').strip()
-                # Need to be flexible with format if needed, but start strict
                 post_time = datetime.strptime(d_str, "%b %d, %Y · %I:%M %p")
                 post_time = post_time.replace(tzinfo=timezone.utc)
                 
                 now = datetime.now(timezone.utc)
                 age = now - post_time
                 
-                if age.total_seconds() > 1800: # 30 * 60 = 1800
+                if age.total_seconds() > 1800: # 30 mins
                     logger.info(f"Skipping {feed_id}: Post too old ({age})")
-                    continue
+                    should_skip = True
                 else:
                     logger.info(f"Fresh post found for {feed_id} (Age: {age})")
             except Exception as e:
-                logger.warning(f"Could not parse date '{latest['date_str']}': {e}. Posting anyway to be safe.")
+                # If parsing fails, it might be relative time like "6m" which means FRESH
+                logger.info(f"Date parse info for {feed_id}: '{latest['date_str']}' - Assuming FRESH, will post.")
+        else:
+            logger.info(f"No date for {feed_id}, will post.")
+        
+        if should_skip:
+            continue
                 
         posts_to_make.append({
             'feed_id': feed_id,
