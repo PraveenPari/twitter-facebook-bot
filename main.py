@@ -412,13 +412,31 @@ async def main_async():
         
         if should_skip:
             continue
+        
+        # Log what we found
+        if latest.get('has_video'):
+            logger.info(f"✅ Found one VIDEO to post for {feed_id}")
+        else:
+            logger.info(f"✅ Found one POST to post for {feed_id}")
+        
+        # Skip text-only posts (no media)
+        if not latest.get('has_video') and not latest.get('media_url'):
+            logger.info(f"⏭️ Skipping {feed_id}: No media (text-only post)")
+            continue
                 
         posts_to_make.append({
             'feed_id': feed_id,
             'tweet': latest
         })
             
-    logger.info(f"Found {len(posts_to_make)} new posts.")
+    logger.info(f"Found {len(posts_to_make)} new posts with media.")
+    
+    # Separate videos (priority) and images
+    video_posts = [p for p in posts_to_make if p['tweet'].get('has_video')]
+    image_posts = [p for p in posts_to_make if not p['tweet'].get('has_video')]
+    
+    logger.info(f"📹 Videos to post immediately: {len(video_posts)}")
+    logger.info(f"🖼️ Images to schedule: {len(image_posts)}")
     
     # 3. Post to Facebook
     page_id = os.environ.get('FB_PAGE_ID') or config['facebook']['page_id']
@@ -426,37 +444,48 @@ async def main_async():
     gemini_key = os.environ.get('GEMINI_API_KEY')
     
     base_time = int(time.time())
+    schedule_slot = 0  # For scheduling images
     
     post_stats = []
     
-    for i, item in enumerate(posts_to_make):
-        logger.info(f"Processing Post for {item['feed_id']}...")
+    # Post VIDEOS first (immediate)
+    for item in video_posts:
+        logger.info(f"🎬 Posting VIDEO for {item['feed_id']}...")
         tweet = item['tweet']
         
-        # Download
-        media_path = None
-        is_video = tweet['has_video']
+        media_path = download_media(tweet['link'], is_video=True)
         
-        if is_video:
-            media_path = download_media(tweet['link'], is_video=True)
-        elif tweet['media_url']:
-            media_path = download_media(tweet['media_url'], is_video=False)
-            
-        # Enhance
         msg = clean_text(tweet['text'])
         logger.info("Enhancing caption...")
         msg = enhance_caption(msg, gemini_key)
         tags = generate_hashtags(msg)
         final_msg = f"{msg}\n\n{' '.join(tags)}"
         
-        # Schedule
-        sched_time = None
-        if i > 0:
-            sched_time = base_time + (i * 600) # 10 min gap
-            
-        # Post
-        res = post_facebook(page_id, token, final_msg, media_path, is_video, i>0, sched_time)
-        post_stats.append({'id': item['feed_id'], 'status': 'success' if 'id' in res or 'post_id' in res else 'failed', 'error': res.get('error')})
+        res = post_facebook(page_id, token, final_msg, media_path, is_video=True, is_sched=False, sched_time=None)
+        post_stats.append({'id': item['feed_id'], 'type': 'video', 'status': 'success' if 'id' in res or 'post_id' in res else 'failed', 'error': res.get('error')})
+        
+        if 'id' in res or 'post_id' in res:
+            state['last_posted_ids'][item['feed_id']] = tweet['id']
+            save_state(state)
+    
+    # Schedule IMAGES after videos
+    for item in image_posts:
+        schedule_slot += 1
+        sched_time = base_time + (schedule_slot * 600)  # 10 min gap
+        
+        logger.info(f"📷 Scheduling IMAGE for {item['feed_id']} at +{schedule_slot*10}min...")
+        tweet = item['tweet']
+        
+        media_path = download_media(tweet['media_url'], is_video=False)
+        
+        msg = clean_text(tweet['text'])
+        logger.info("Enhancing caption...")
+        msg = enhance_caption(msg, gemini_key)
+        tags = generate_hashtags(msg)
+        final_msg = f"{msg}\n\n{' '.join(tags)}"
+        
+        res = post_facebook(page_id, token, final_msg, media_path, is_video=False, is_sched=True, sched_time=sched_time)
+        post_stats.append({'id': item['feed_id'], 'type': 'image', 'status': 'success' if 'id' in res or 'post_id' in res else 'failed', 'error': res.get('error')})
         
         if 'id' in res or 'post_id' in res:
             state['last_posted_ids'][item['feed_id']] = tweet['id']
