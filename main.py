@@ -90,13 +90,13 @@ def enhance_caption(caption, api_key):
     except:
         return caption
 
-async def scrape_nitter_user_playwright(username, browser):
-    """Scrape nitter.net using Playwright"""
+async def scrape_nitter_user_playwright_context(username, context):
+    """Scrape nitter.net using Playwright Context (for video)"""
     url = f"https://nitter.net/{username}"
     logger.info(f"[{username}] Navigating to {url}")
     
     tweets = []
-    page = await browser.new_page()
+    page = await context.new_page()
     
     # Retry logic for slow pages
     MAX_RETRIES = 2
@@ -104,10 +104,8 @@ async def scrape_nitter_user_playwright(username, browser):
         try:
             logger.info(f"[{username}] Attempt {attempt+1}/{MAX_RETRIES}: Waiting for page load (timeout=120s)...")
             
-            # Wait for 'domcontentloaded' is usually enough for content, but we wait long
             await page.goto(url, timeout=120000, wait_until='domcontentloaded') 
             
-            # Check for specific error text first
             content = await page.content()
             if "Rate limit exceeded" in content or "Instance has been rate limited" in content:
                  logger.error(f"[{username}] Nitter Rate Limit detected!")
@@ -116,20 +114,26 @@ async def scrape_nitter_user_playwright(username, browser):
                      continue
                  return []
             
-            # Wait for timeline strictly
             logger.info(f"[{username}] Waiting for timeline selector...")
             await page.wait_for_selector('.timeline-item', timeout=60000)
             
             logger.info(f"[{username}] Page & Timeline loaded successfully")
-            break # Success, exit retry loop
+            break 
             
         except Exception as e:
-            # Enhanced debugging
             title = "Unknown"
             try: title = await page.title()
             except: pass
             
             logger.error(f"[{username}] Attempt {attempt+1} failed: {str(e)[:200]} | Page Title: {title}")
+            
+            # Take Screenshot on failure
+            shot_path = f"debug_shot_{username}_{attempt}.png"
+            try:
+                await page.screenshot(path=shot_path, full_page=True)
+                logger.info(f"[{username}] Screenshot saved to {shot_path}")
+            except:
+                pass
             
             if attempt < MAX_RETRIES - 1:
                 logger.info(f"[{username}] Retrying in 5 seconds...")
@@ -261,14 +265,19 @@ async def main_async():
     config = load_config()
     state = load_state()
     
-    # ... (YouTube check remains similar, adding logging)
+    # 1. Check YouTube Live
     if HAS_YOUTUBE and config.get('youtube_restream', {}).get('enabled'):
         logger.info("Checking YouTube Live...")
-        # ...
-    
+        if youtube_live_monitor.check_and_restream(config):
+            logger.info("Re-streaming started. Stopping Twitter check.")
+            return # Stop if re-streaming
+
+    # 2. Check Twitter (Nitter)
     logger.info("Starting Playwright Browser...")
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # Launch with video recording enabled
+        browser = await p.chromium.launch(headless=True) # Keep headless True as requested, but record video
+        context = await browser.new_context(record_video_dir="debug_videos")
         
         accounts = config.get('feeds', []) or config.get('twitter_accounts', [])
         logger.info(f"Loaded {len(accounts)} accounts to check.")
@@ -284,38 +293,38 @@ async def main_async():
             
             if username:
                 logger.info(f"Processing Account {i+1}/{len(accounts)}: {username}")
-                # Process one by one
-                tweets = await scrape_nitter_user_playwright(username, browser)
+                # Pass context to function instead of browser to allow new_page with video
+                tweets = await scrape_nitter_user_playwright_context(username, context)
                 results.append(tweets)
                 # Small delay between checks
                 await asyncio.sleep(2)
             else:
                  logger.warning(f"Skipping account {i+1}, no username found.")
                  results.append([])
-
         
-        # Process results
-        posts_to_make = []
-        for i, tweets in enumerate(results):
-            if not tweets: continue
-            
-            # Use account 'id' for state key
-            acc = accounts[i]
-            feed_id = acc.get('id', acc.get('username', 'unknown'))
-            
-            latest = tweets[0] # Take most recent
-            
-            # Check if posted
-            if state.get('last_posted_ids', {}).get(feed_id) == latest['id']:
-                continue
-                
-            posts_to_make.append({
-                'feed_id': feed_id,
-                'tweet': latest
-            })
-            
+        await context.close()
         await browser.close()
         
+    # Process results
+    posts_to_make = []
+    for i, tweets in enumerate(results):
+        if not tweets: continue
+        
+        # Use account 'id' for state key
+        acc = accounts[i]
+        feed_id = acc.get('id', acc.get('username', 'unknown'))
+        
+        latest = tweets[0] # Take most recent
+        
+        # Check if posted
+        if state.get('last_posted_ids', {}).get(feed_id) == latest['id']:
+            continue
+            
+        posts_to_make.append({
+            'feed_id': feed_id,
+            'tweet': latest
+        })
+            
     logger.info(f"Found {len(posts_to_make)} new posts.")
     
     # 3. Post to Facebook
