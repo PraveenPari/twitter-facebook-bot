@@ -50,7 +50,7 @@ jobs:
           echo "$CONFIG_JSON" > config.json
           
           # Run the bot
-          python main.py
+          xvfb-run --auto-servernum python main.py
 
       - name: Upload Debug Artifacts
         if: always()
@@ -62,6 +62,8 @@ jobs:
             debug_shot_*.png
             debug_videos/
             state.json
+            run_report.json
+            cucumber_report.json
       
       - name: Upload state to Gist
         if: always()
