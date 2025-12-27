@@ -101,11 +101,23 @@ async def scrape_nitter_user_playwright(username, browser):
         # 1. Navigation with improved waiting
         try:
             logger.info(f"[{username}] Waiting for page load (timeout=90s)...")
-            await page.goto(url, timeout=90000, wait_until='networkidle')
-            await page.wait_for_selector('.timeline-item', timeout=20000)
+            await page.goto(url, timeout=90000, wait_until='domcontentloaded') # loosen to domcontentloaded to avoid hanging on stray requests
+            
+            # Check for specific error text first
+            content = await page.content()
+            if "Rate limit exceeded" in content or "Instance has been rate limited" in content:
+                 logger.error(f"[{username}] Nitter Rate Limit detected!")
+                 return []
+            
+            await page.wait_for_selector('.timeline-item', timeout=60000) # Increased to 60s
             logger.info(f"[{username}] Page loaded successfully")
         except Exception as e:
-            logger.error(f"[{username}] Navigation failed: {str(e)[:200]}")
+            # Enhanced debugging
+            try:
+                title = await page.title()
+                logger.error(f"[{username}] Navigation failed: {str(e)[:200]} | Page Title: {title}")
+            except:
+                logger.error(f"[{username}] Navigation failed: {str(e)[:200]}")
             return []
 
         # 2. Scrape Items
