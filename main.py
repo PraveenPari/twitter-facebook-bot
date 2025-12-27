@@ -98,77 +98,46 @@ def enhance_caption(caption, api_key):
     except:
         return caption
 
-async def scrape_nitter_user_playwright_context(username, browser):
-    """Scrape nitter using a fresh Playwright Context per user (for isolated video/state)"""
+async def scrape_nitter_user_tab(username, context):
+    """Scrape nitter using a new tab in shared context (faster)"""
     
-    # List of reliable instances
     instances = [
-        "https://nitter.net",
-        "https://nitter.poast.org",
-        "https://nitter.privacydev.net",
-        "https://nitter.lucabased.xyz"
+        "https://nitter.net"
     ]
     
     tweets = []
-    today_date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     
-    # Create fresh context
-    context = await browser.new_context(
-        record_video_dir="debug_videos",
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        viewport={'width': 1920, 'height': 1080},
-        locale='en-US'
-    )
+    logger.info(f"[{username}] Starting scrape...")
     
-    msg = f"[{username}] Starting scrape..."
-    logger.info(msg)
-    
-    # Create page
+    # Create new tab (page) in shared context
     page = await context.new_page()
-    video = page.video
     
     try:
         for instance in instances:
             url = f"{instance}/{username}"
-            logger.info(f"[{username}] Trying instance: {instance}...")
+            logger.info(f"[{username}] Trying {instance}...")
             
             try:
-                logger.info(f"[{username}] Waiting for page load (timeout=60s)...")
                 try:
-                    await page.goto(url, timeout=60000, wait_until='domcontentloaded') 
+                    await page.goto(url, timeout=30000, wait_until='domcontentloaded') 
                     title = await page.title()
-                    logger.info(f"[{username}] Page loaded. Title: {title}")
+                    logger.info(f"[{username}] Loaded: {title}")
                 except:
-                    logger.error(f"[{username}] Timeout connecting to {instance}")
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    shot_path = f"debug_shot_{username}_{timestamp}_timeout.png"
-                    try: await page.screenshot(path=shot_path)
-                    except: pass
+                    logger.error(f"[{username}] Timeout on {instance}")
                     continue 
 
                 content = await page.content()
                 if "Rate limit" in content or "upstream connect error" in content:
-                     logger.error(f"[{username}] Blocked/Error on {instance}")
-                     continue
+                    logger.error(f"[{username}] Blocked on {instance}")
+                    continue
                 
-                logger.info(f"[{username}] Waiting for timeline...")
                 try:
-                    await page.wait_for_selector('.timeline-item', timeout=20000)
+                    await page.wait_for_selector('.timeline-item', timeout=15000)
                 except:
-                     logger.error(f"[{username}] Timeline didn't load on {instance}")
-                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                     shot_path = f"debug_shot_{username}_{timestamp}_fail.png"
-                     try: await page.screenshot(path=shot_path, full_page=True)
-                     except: pass
-                     continue
+                    logger.error(f"[{username}] Timeline failed on {instance}")
+                    continue
                 
-                logger.info(f"[{username}] Success on {instance}!")
-                
-                # Take Success Screenshot for Report
-                try: 
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    await page.screenshot(path=f"debug_shot_{username}_{timestamp}_success.png", full_page=True)
-                except: pass
+                logger.info(f"[{username}] ✅ Success!")
                 
                 items = await page.query_selector_all('.timeline-item')
                 logger.info(f"[{username}] Found {len(items)} items")
@@ -193,12 +162,16 @@ async def scrape_nitter_user_playwright_context(username, browser):
                     vid_el = await item.query_selector('.attachments video')
                     if vid_el: has_video = True
                     
-                    # Extract Timestamp we need for 30m check
+                    # Extract Timestamp
                     date_str = ""
                     date_el = await item.query_selector('.tweet-date a')
                     if date_el:
-                        date_str = await date_el.get_attribute('title') 
-                        # format often: "Dec 27, 2025 · 3:30 PM UTC"
+                        date_str = await date_el.get_attribute('title')
+                    
+                    # Check Pinned
+                    is_pinned = False
+                    pin_el = await item.query_selector('.pinned')
+                    if pin_el: is_pinned = True
 
                     if tweet_id:
                         tweets.append({
@@ -207,39 +180,18 @@ async def scrape_nitter_user_playwright_context(username, browser):
                             'link': full_link,
                             'media_url': media_url,
                             'has_video': has_video,
-                            'date_str': date_str
+                            'date_str': date_str,
+                            'is_pinned': is_pinned
                         })
                 
-                break 
+                break  # Success, exit instance loop
                 
             except Exception as e:
-                logger.error(f"Error on {instance}: {e}")
+                logger.error(f"[{username}] Error: {e}")
                 continue 
                 
     finally:
-        # Wait 5 seconds to ensure video captures the final state (success or error)
-        logger.info(f"[{username}] Waiting 5s for video capture...")
-        await asyncio.sleep(5)
-
-        # Save video cleanly
-        try:
-            vid_path = await video.path() 
-            await context.close() # CRITICAL: Close context releases file lock
-            
-            if vid_path:
-                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                 new_name = f"debug_videos/{username}_{timestamp}.webm"
-                 os.makedirs("debug_videos", exist_ok=True)
-                 # Retry loop for rename
-                 for _ in range(3):
-                     try:
-                         os.replace(vid_path, new_name)
-                         logger.info(f"[{username}] Saved debug video: {new_name}")
-                         break
-                     except Exception as e:
-                         await asyncio.sleep(1)
-        except Exception as e:
-            logger.error(f"Failed to save/rename video: {e}")
+        await page.close()
 
     return tweets
 
@@ -346,29 +298,43 @@ async def main_async():
             ]
         )
         
+        # Create ONE shared context for all tabs
+        context = await browser.new_context(
+            record_video_dir="debug_videos",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US'
+        )
+        
         accounts = config.get('feeds', []) or config.get('twitter_accounts', [])
         logger.info(f"Loaded {len(accounts)} accounts to check.")
 
-        # Sequential scraping for stability
-        results = []
-        for i, acc in enumerate(accounts):
+        # Prepare usernames
+        usernames = []
+        for acc in accounts:
             username = acc.get('username')
-            # Only extract if needed
             if not username and 'url' in acc:
                 username = acc['url'].strip('/').split('/')[-1]
                 if username == 'rss': username = acc['url'].strip('/').split('/')[-2]
-            
-            if username:
-                logger.info(f"Processing Account {i+1}/{len(accounts)}: {username}")
-                # Pass browser to function to allow fresh context creation
-                tweets = await scrape_nitter_user_playwright_context(username, browser)
-                results.append(tweets)
-                # Small delay between checks
-                await asyncio.sleep(2)
-            else:
-                 logger.warning(f"Skipping account {i+1}, no username found.")
-                 results.append([])
+            usernames.append(username)
         
+        # Scrape ALL accounts in PARALLEL using tabs
+        async def scrape_in_tab(username, context):
+            if not username:
+                return []
+            return await scrape_nitter_user_tab(username, context)
+        
+        logger.info(f"🚀 Scraping {len(usernames)} accounts in parallel...")
+        tasks = [scrape_in_tab(u, context) for u in usernames]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle exceptions
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(f"Error scraping {usernames[i]}: {r}")
+                results[i] = []
+        
+        await context.close()
         await browser.close()
         
     # Process results
@@ -380,53 +346,66 @@ async def main_async():
         acc = accounts[i]
         feed_id = acc.get('id', acc.get('username', 'unknown'))
         
-        latest = tweets[0] # Take most recent
+        # Find the BEST tweet (skip pinned, skip already posted, skip old)
+        best_tweet = None
+        for tweet in tweets:
+            tweet_id = tweet['id']
+            
+            # Skip if pinned (often old)
+            if tweet.get('is_pinned'):
+                logger.info(f"[{feed_id}] Skipping pinned tweet {tweet_id}")
+                continue
+            
+            # Skip if already posted
+            if state.get('last_posted_ids', {}).get(feed_id) == tweet_id:
+                logger.info(f"[{feed_id}] Already posted {tweet_id}")
+                continue
+            
+            # Skip if no media
+            if not tweet.get('has_video') and not tweet.get('media_url'):
+                logger.info(f"[{feed_id}] Skipping {tweet_id}: text-only (no media)")
+                continue
+                
+            # Check Time (Strict 30 mins)
+            is_old = False
+            if 'date_str' in tweet and tweet['date_str']:
+                try:
+                    d_str = tweet['date_str'].replace('UTC', '').strip()
+                    post_time = datetime.strptime(d_str, "%b %d, %Y · %I:%M %p")
+                    post_time = post_time.replace(tzinfo=timezone.utc)
+                    
+                    now = datetime.now(timezone.utc)
+                    age = now - post_time
+                    
+                    if age.total_seconds() > 1800: # 30 mins
+                        logger.info(f"[{feed_id}] Tweet {tweet_id} too old ({age})")
+                        is_old = True
+                    else:
+                        logger.info(f"[{feed_id}] Fresh tweet {tweet_id} (Age: {age})")
+                except Exception as e:
+                    # Parsing failed = likely relative time like "6m" = FRESH
+                    logger.info(f"[{feed_id}] Tweet {tweet_id} date='{tweet['date_str']}' (Assuming FRESH)")
+            
+            if is_old:
+                continue
+                
+            # Found a valid tweet!
+            best_tweet = tweet
+            break  # Take the first valid one
         
-        # Check if posted
-        if state.get('last_posted_ids', {}).get(feed_id) == latest['id']:
-            logger.info(f"Skipping {feed_id}: Already posted {latest['id']}")
+        if not best_tweet:
+            logger.info(f"[{feed_id}] No valid tweets found")
             continue
             
-        # Check Time (Strict 30 mins)
-        should_skip = False
-        if 'date_str' in latest and latest['date_str']:
-            try:
-                # Format: "Dec 27, 2025 · 3:30 PM UTC"
-                d_str = latest['date_str'].replace('UTC', '').strip()
-                post_time = datetime.strptime(d_str, "%b %d, %Y · %I:%M %p")
-                post_time = post_time.replace(tzinfo=timezone.utc)
-                
-                now = datetime.now(timezone.utc)
-                age = now - post_time
-                
-                if age.total_seconds() > 1800: # 30 mins
-                    logger.info(f"Skipping {feed_id}: Post too old ({age})")
-                    should_skip = True
-                else:
-                    logger.info(f"Fresh post found for {feed_id} (Age: {age})")
-            except Exception as e:
-                # If parsing fails, it might be relative time like "6m" which means FRESH
-                logger.info(f"Date parse info for {feed_id}: '{latest['date_str']}' - Assuming FRESH, will post.")
-        else:
-            logger.info(f"No date for {feed_id}, will post.")
-        
-        if should_skip:
-            continue
-        
         # Log what we found
-        if latest.get('has_video'):
-            logger.info(f"✅ Found one VIDEO to post for {feed_id}")
+        if best_tweet.get('has_video'):
+            logger.info(f"✅ Found VIDEO to post for {feed_id}")
         else:
-            logger.info(f"✅ Found one POST to post for {feed_id}")
-        
-        # Skip text-only posts (no media)
-        if not latest.get('has_video') and not latest.get('media_url'):
-            logger.info(f"⏭️ Skipping {feed_id}: No media (text-only post)")
-            continue
+            logger.info(f"✅ Found IMAGE to post for {feed_id}")
                 
         posts_to_make.append({
             'feed_id': feed_id,
-            'tweet': latest
+            'tweet': best_tweet
         })
             
     logger.info(f"Found {len(posts_to_make)} new posts with media.")
@@ -444,7 +423,6 @@ async def main_async():
     gemini_key = os.environ.get('GEMINI_API_KEY')
     
     base_time = int(time.time())
-    schedule_slot = 0  # For scheduling images
     
     post_stats = []
     
@@ -454,6 +432,10 @@ async def main_async():
         tweet = item['tweet']
         
         media_path = download_media(tweet['link'], is_video=True)
+        if not media_path:
+            logger.error(f"Failed to download video for {item['feed_id']}")
+            post_stats.append({'id': item['feed_id'], 'type': 'video', 'status': 'failed', 'error': 'download_failed'})
+            continue
         
         msg = clean_text(tweet['text'])
         logger.info("Enhancing caption...")
@@ -467,16 +449,18 @@ async def main_async():
         if 'id' in res or 'post_id' in res:
             state['last_posted_ids'][item['feed_id']] = tweet['id']
             save_state(state)
+            logger.info(f"✅ VIDEO posted successfully for {item['feed_id']}")
     
-    # Schedule IMAGES after videos
+    # Post IMAGES (also immediate, after videos)
     for item in image_posts:
-        schedule_slot += 1
-        sched_time = base_time + (schedule_slot * 600)  # 10 min gap
-        
-        logger.info(f"📷 Scheduling IMAGE for {item['feed_id']} at +{schedule_slot*10}min...")
+        logger.info(f"📷 Posting IMAGE for {item['feed_id']}...")
         tweet = item['tweet']
         
         media_path = download_media(tweet['media_url'], is_video=False)
+        if not media_path:
+            logger.error(f"Failed to download image for {item['feed_id']}")
+            post_stats.append({'id': item['feed_id'], 'type': 'image', 'status': 'failed', 'error': 'download_failed'})
+            continue
         
         msg = clean_text(tweet['text'])
         logger.info("Enhancing caption...")
@@ -484,12 +468,13 @@ async def main_async():
         tags = generate_hashtags(msg)
         final_msg = f"{msg}\n\n{' '.join(tags)}"
         
-        res = post_facebook(page_id, token, final_msg, media_path, is_video=False, is_sched=True, sched_time=sched_time)
+        res = post_facebook(page_id, token, final_msg, media_path, is_video=False, is_sched=False, sched_time=None)
         post_stats.append({'id': item['feed_id'], 'type': 'image', 'status': 'success' if 'id' in res or 'post_id' in res else 'failed', 'error': res.get('error')})
         
         if 'id' in res or 'post_id' in res:
             state['last_posted_ids'][item['feed_id']] = tweet['id']
             save_state(state)
+            logger.info(f"✅ IMAGE posted successfully for {item['feed_id']}")
             
     # Save Reports
     run_timestamp = datetime.now().isoformat()
