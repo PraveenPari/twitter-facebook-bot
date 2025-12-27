@@ -468,31 +468,93 @@ async def main_async():
     else:
         print("[WARNING] No credentials - using guest mode")
     
-    # **PARALLEL EXECUTION: Check accounts in batches to avoid rate limiting**
+    # **SEQUENTIAL EXECUTION: Check accounts ONE BY ONE to avoid errors**
     print(f"\n{'='*60}")
-    print(f"CHECKING ALL {len(twitter_accounts)} ACCOUNTS (2 at a time)...")
+    print(f"CHECKING {len(twitter_accounts)} ACCOUNTS SEQUENTIALLY...")
     print(f"{'='*60}\n")
     
     posts = []
-    batch_size = 2  # Check 2 accounts at a time to avoid Twitter blocking
     
-    for i in range(0, len(twitter_accounts), batch_size):
-        batch = twitter_accounts[i:i+batch_size]
-        print(f"\nBatch {i//batch_size + 1}: Checking {len(batch)} accounts...")
+    for i, account_config in enumerate(twitter_accounts, 1):
+        if not account_config.get('enabled', True):
+            continue
         
-        tasks = [
-            check_account_parallel(scraper, account_config, state, post_window, min_length)
-            for account_config in batch
-        ]
+        account_id = account_config.get('id', 'unknown')
+        username = account_config.get('username', '').replace('@', '')
         
-        # Run batch concurrently
-        results = await asyncio.gather(*tasks)
-        posts.extend([post for post in results if post is not None])
+        if not username:
+            continue
         
-        # Add delay between batches to avoid rate limiting
-        if i + batch_size < len(twitter_accounts):
-            print(f"Waiting 5s before next batch...")
-            await asyncio.sleep(5)
+        print(f"\n[{i}/{len(twitter_accounts)}] Checking @{username}...")
+        
+        try:
+            # Fetch latest tweet using browser (sequential, one at a time)
+            tweets = await scraper.get_latest_tweets(username, count=1)
+            
+            if not tweets:
+                print(f"  No tweets found")
+                continue
+            
+            latest_tweet = tweets[0]
+            tweet_id = str(latest_tweet['id'])
+            
+            # Skip if not from target username
+            tweet_user = latest_tweet.get('user', '').lower()
+            if tweet_user != username.lower():
+                print(f"  SKIP: Sponsored (from @{tweet_user})")
+                continue
+            
+            # Skip if already posted
+            last_id = state.get('last_posted_ids', {}).get(account_id)
+            if last_id == tweet_id:
+                print(f"  Already posted")
+                continue
+            
+            # Check time window
+            tweet_time = latest_tweet['created_at']
+            now = datetime.now(timezone.utc)
+            if tweet_time.tzinfo is None:
+                tweet_time = tweet_time.replace(tzinfo=timezone.utc)
+            
+            age_minutes = (now - tweet_time).total_seconds() / 60
+            if age_minutes > post_window:
+                print(f"  Too old ({age_minutes:.0f} min)")
+                continue
+            
+            # Skip retweets and replies
+            if latest_tweet['is_retweet']:
+                print(f"  SKIP: Retweet")
+                continue
+            
+            if latest_tweet['is_reply']:
+                print(f"  SKIP: Reply")
+                continue
+            
+            # Clean and check message
+            message = clean_text(latest_tweet['text'])
+            
+            if len(message) < min_length:
+                print(f"  SKIP: Too short ({len(message)} chars)")
+                continue
+            
+            print(f"  ✅ Valid tweet ({len(message)} chars, {age_minutes:.0f}min old)")
+            
+            posts.append({
+                'account_id': account_id,
+                'tweet_id': tweet_id,
+                'message': message,
+                'tweet_url': latest_tweet['url'],
+                'media': latest_tweet['media'],
+                'has_video': latest_tweet['has_video']
+            })
+            
+        except Exception as e:
+            print(f"  Error: {e}")
+            continue
+        
+        # Small delay between accounts to be respectful
+        if i < len(twitter_accounts):
+            await asyncio.sleep(2)
     
     await scraper.close()
     

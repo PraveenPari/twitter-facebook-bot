@@ -156,13 +156,14 @@ class TwitterBrowserScraper:
             url = f"https://twitter.com/{username}"
             print(f"  [Browser] Navigating to @{username}...")
             
-            await self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            # Navigate and WAIT for full page load (DOM + network)
+            await self.page.goto(url, wait_until='networkidle', timeout=30000)
             
-            # Wait for content (reduced from 5s to 2s)
+            # Wait for content (increased to ensure full load)
             print(f"  [Browser] Waiting for content...")
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             
-            # Scroll to trigger lazy loading (reduced iterations)
+            # Scroll to trigger lazy loading
             for i in range(2):  # Reduced from 5 to 2
                 await self.page.evaluate('window.scrollBy(0, 800)')
                 await asyncio.sleep(0.5)  # Reduced from 1s to 0.5s
