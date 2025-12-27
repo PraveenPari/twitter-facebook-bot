@@ -468,21 +468,31 @@ async def main_async():
     else:
         print("[WARNING] No credentials - using guest mode")
     
-    # **PARALLEL EXECUTION: Check all accounts concurrently**
+    # **PARALLEL EXECUTION: Check accounts in batches to avoid rate limiting**
     print(f"\n{'='*60}")
-    print(f"CHECKING ALL {len(twitter_accounts)} ACCOUNTS IN PARALLEL...")
+    print(f"CHECKING ALL {len(twitter_accounts)} ACCOUNTS (3 at a time)...")
     print(f"{'='*60}\n")
     
-    tasks = [
-        check_account_parallel(scraper, account_config, state, post_window, min_length)
-        for account_config in twitter_accounts
-    ]
+    posts = []
+    batch_size = 3  # Check 3 accounts at a time to avoid Twitter blocking
     
-    # Run all checks concurrently
-    results = await asyncio.gather(*tasks)
-    
-    # Filter out None results
-    posts = [post for post in results if post is not None]
+    for i in range(0, len(twitter_accounts), batch_size):
+        batch = twitter_accounts[i:i+batch_size]
+        print(f"\nBatch {i//batch_size + 1}: Checking {len(batch)} accounts...")
+        
+        tasks = [
+            check_account_parallel(scraper, account_config, state, post_window, min_length)
+            for account_config in batch
+        ]
+        
+        # Run batch concurrently
+        results = await asyncio.gather(*tasks)
+        posts.extend([post for post in results if post is not None])
+        
+        # Add delay between batches to avoid rate limiting
+        if i + batch_size < len(twitter_accounts):
+            print(f"Waiting 5s before next batch...")
+            await asyncio.sleep(5)
     
     await scraper.close()
     
