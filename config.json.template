@@ -22,8 +22,12 @@
     "user_id": "USE_ENV_VAR",
     "access_token": "USE_ENV_VAR"
   },
+  "instagrapi": {
+    "username": "YOUR_INSTAGRAM_USERNAME",
+    "password": "YOUR_INSTAGRAM_PASSWORD"
+  },
   "settings": {
-    "post_window_minutes": 60,
+    "post_window_minutes": 10,
     "schedule_gap_minutes": 10,
     "min_content_length": 5
   },
