@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests yt-dlp google-genai playwright beautifulsoup4
+          pip install requests yt-dlp playwright beautifulsoup4 instagrapi
           
       - name: Install Playwright Browsers
         run: |
