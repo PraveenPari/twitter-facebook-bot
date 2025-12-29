@@ -372,10 +372,19 @@ def download_media(url, is_video=False):
                 
             logger.info(f"Downloading video from {tweet_url}...")
             
+            # Force compatible format (mp4/h264) for Instagram/Facebook
             out_tmpl = os.path.join(temp_dir, '%(id)s.%(ext)s')
-            ydl_opts = {'format': 'bestv+besta/best', 'outtmpl': out_tmpl, 'quiet':True}
+            # 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' 
+            # This prioritizes mp4 containers which are safest for Graph API
+            ydl_opts = {
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', 
+                'outtmpl': out_tmpl, 
+                'quiet':True,
+                'merge_output_format': 'mp4' # Force merge to mp4 if needed
+            }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(tweet_url, download=True)
+                # ... (rest of function same) ...
                 if info:
                      # Get actual filename
                     path = ydl.prepare_filename(info)
@@ -970,7 +979,8 @@ async def main_async():
                 ig_status_str = "posted" if ig_success else "failed/skipped"
                 logger.info(f"[OK] FB scheduled, IG {ig_status_str} for {item['feed_id']}")
             else:
-                logger.info(f"[OK] {media_type} posted for {item['feed_id']}")
+                ig_status_str = "IG:OK" if ig_success else "IG:FAIL/SKIP"
+                logger.info(f"[OK] {media_type} posted (FB:OK {ig_status_str}) for {item['feed_id']}")
             
     # Save Reports
     run_timestamp = datetime.now().isoformat()
