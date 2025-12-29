@@ -18,12 +18,7 @@ import yt_dlp
 from playwright.async_api import async_playwright
 import logging
 
-try:
-    from google import genai
-    from google.genai import types
-    HAS_GEMINI = True
-except ImportError:
-    HAS_GEMINI = False
+# Gemini AI removed - not needed
 
 # Import YouTube monitor
 try:
@@ -32,7 +27,22 @@ try:
 except ImportError:
     HAS_YOUTUBE = False
 
+# Import instagrapi for trending hashtags
+try:
+    from instagrapi import Client as InstaClient
+    HAS_INSTAGRAPI = True
+except ImportError:
+    HAS_INSTAGRAPI = False
+    logger.warning("instagrapi not installed - trending hashtags feature disabled")
+
 # Configure Logging
+# Force UTF-8 for stdout on Windows to support emojis
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -75,28 +85,172 @@ def save_state(state):
 
 def clean_text(text):
     if not text: return ''
+    # Remove all URLs (including nitter URLs)
     text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'nitter\.\S+', '', text)  # Remove any remaining nitter references
     text = re.sub(r'^(@\w+\s*)+', '', text)
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-# TVK Hashtags (Shortened)
+# TVK Hashtags (Shortened) - Static fallback hashtags
 TVK_HASHTAGS = ["#TVK", "#ThamizhagaVetriKazhagam", "#ThalapathyVijay", "#TamilNadu"]
 
-def generate_hashtags(content):
-    tags = TVK_HASHTAGS.copy()
-    if 'election' in content.lower(): tags.append("#TNElection2026")
-    return tags[:10]
+# Cache for trending hashtags (refreshed each run)
+_trending_hashtags_cache = None
 
-def enhance_caption(caption, api_key):
-    if not HAS_GEMINI or not api_key: return caption
+def fetch_trending_hashtags_from_instagram(ig_username=None, ig_password=None):
+    """
+    Fetch real-time trending hashtags from TVK, TVKVijay, actorvijay Instagram.
+    Uses search_hashtags API which returns related trending tags.
+    """
+    global _trending_hashtags_cache
+    
+    if _trending_hashtags_cache is not None:
+        return _trending_hashtags_cache
+    
+    if not HAS_INSTAGRAPI:
+        logger.warning("instagrapi not available - using static hashtags")
+        return TVK_HASHTAGS
+    
+    # Get Instagram credentials from: 1) Function args, 2) Environment, 3) Config file
+    config = {}
     try:
-        client = genai.Client(api_key=api_key)
-        prompt = f"Enhance this Tamil political caption for Facebook (TVK party, Vijay). Positive, inspiring. Max 300 chars. Caption: {caption}"
-        resp = client.models.generate_content(model='gemini-2.0-flash-exp', contents=prompt)
-        return resp.text.strip() if resp.text else caption
+        config = load_config()
     except:
-        return caption
+        pass
+    
+    instagrapi_config = config.get('instagrapi', {})
+    
+    username = ig_username or os.environ.get('IG_SCRAPE_USERNAME') or instagrapi_config.get('username')
+    password = ig_password or os.environ.get('IG_SCRAPE_PASSWORD') or instagrapi_config.get('password')
+    
+    if not username or not password:
+        logger.warning("Instagram credentials not provided - using static hashtags")
+        return TVK_HASHTAGS
+    
+    SESSION_FILE = "ig_session.json"
+    
+    try:
+        logger.info("Fetching trending hashtags from Instagram...")
+        cl = InstaClient()
+        cl.delay_range = [1, 3]
+        
+        # Try to reuse existing session for faster login
+        if os.path.exists(SESSION_FILE):
+            try:
+                cl.load_settings(SESSION_FILE)
+                cl.login(username, password)
+                logger.info("Instagram session reused")
+            except:
+                cl = InstaClient()
+                cl.login(username, password)
+                cl.dump_settings(SESSION_FILE)
+                logger.info("Fresh Instagram login")
+        else:
+            cl.login(username, password)
+            cl.dump_settings(SESSION_FILE)
+            logger.info("Instagram login successful")
+        
+        # Hashtags to search for related trending tags
+        search_terms = ['TVK', 'TVKVijay', 'actorvijay', 'ThalapathyVijay', 'Vijay']
+        
+        all_hashtags = []
+        
+        for term in search_terms:
+            try:
+                logger.info(f"Searching related hashtags for #{term}...")
+                
+                # search_hashtags returns list of related/trending hashtags
+                results = cl.search_hashtags(term)
+                
+                for hashtag in results[:10]:  # Take top 10 related
+                    # Clean the hashtag name (remove emojis/special chars for cleaner look)
+                    tag_name = hashtag.name
+                    # Keep alphanumeric and some unicode chars
+                    all_hashtags.append('#' + tag_name)
+                
+                logger.info(f"Found {len(results)} related hashtags for #{term}")
+                time.sleep(1)  # Small delay
+                
+            except Exception as e:
+                logger.warning(f"Failed to search #{term}: {e}")
+                continue
+        
+        # Count and deduplicate
+        from collections import Counter
+        hashtag_counts = Counter(all_hashtags)
+        
+        # Get unique tags, prioritizing most common
+        trending = [tag for tag, count in hashtag_counts.most_common(30)]
+        
+        # Clean hashtags - only keep English alphanumeric hashtags
+        clean_trending = []
+        
+        # Words to exclude from hashtags (negative/inappropriate content)
+        excluded_words = ['stampede', 'sethu', 'devar', 'death', 'dead', 'kill', 'accident', 'tragedy', 'rip']
+        
+        for tag in trending:
+            # Remove the # for checking
+            tag_text = tag[1:] if tag.startswith('#') else tag
+            
+            # Only keep hashtags that are purely ASCII alphanumeric (English letters + numbers)
+            # This removes hashtags with special chars like ü, ş, ä, emojis, etc.
+            if not (tag_text.isascii() and tag_text.isalnum()):
+                continue
+            
+            # Exclude hashtags containing negative words
+            tag_lower = tag_text.lower()
+            if any(word in tag_lower for word in excluded_words):
+                logger.info(f"Excluding hashtag with negative word: #{tag_text}")
+                continue
+            
+            clean_trending.append('#' + tag_text)
+        
+        # Add core TVK hashtags at the beginning
+        core_tags = ['#TVK', '#ThamizhagaVetriKazhagam', '#ThalapathyVijay', '#TamilNadu']
+        final_trending = core_tags + [t for t in clean_trending if t.lower() not in [c.lower() for c in core_tags]]
+        
+        # Fallback hashtags if not enough trending ones found
+        fallback_hashtags = [
+            '#Vijay', '#VijayPolitics', '#TNPolitics', '#TamilNadu2026',
+            '#VijayForCM', '#Tamilnadu', '#TamilPolitics', '#VijayFans',
+            '#VijayArmy', '#ThalapathyForever', '#TVKParty'
+        ]
+        
+        # Ensure we have exactly 25 hashtags
+        while len(final_trending) < 25 and fallback_hashtags:
+            fb_tag = fallback_hashtags.pop(0)
+            if fb_tag.lower() not in [t.lower() for t in final_trending]:
+                final_trending.append(fb_tag)
+        
+        logger.info(f"Trending hashtags ({len(final_trending)}): {final_trending[:10]}")
+        
+        # Cache the result - exactly 25 hashtags
+        _trending_hashtags_cache = final_trending[:25]
+        
+        return _trending_hashtags_cache
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch trending hashtags: {e}")
+        return TVK_HASHTAGS
+
+def generate_hashtags(content, use_trending=True):
+    """
+    Generate hashtags - combines trending hashtags with content-based ones.
+    """
+    if use_trending:
+        tags = fetch_trending_hashtags_from_instagram()
+    else:
+        tags = TVK_HASHTAGS.copy()
+    
+    # Add content-based hashtags
+    if 'election' in content.lower(): 
+        tags.insert(0, "#TNElection2026")
+    
+    # Return exactly 25 hashtags
+    return tags[:25]
+
+# Caption enhancement removed - using original caption
 
 async def scrape_nitter_user_tab(username, context):
     """Scrape nitter using a new tab in shared context (faster)"""
@@ -324,86 +478,57 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
                 logger.error(f"Video too large for Instagram: {file_size / 1024 / 1024:.2f} MB (max 300MB)")
                 return {'error': 'Video too large for Instagram (max 300MB)'}
             
-            # Method 1: Try uploading video to catbox.moe and use video_url approach
-            video_url = None
-            try:
-                logger.info("Uploading video to catbox.moe for Instagram...")
-                catbox_url = "https://catbox.moe/user/api.php"
-                files = {
-                    'fileToUpload': ('video.mp4', video_data, 'video/mp4')
-                }
-                data = {
-                    'reqtype': 'fileupload'
-                }
-                catbox_resp = requests.post(catbox_url, files=files, data=data, timeout=120)
-                if catbox_resp.status_code == 200 and catbox_resp.text.startswith('https://'):
-                    video_url = catbox_resp.text.strip()
-                    logger.info(f"Video hosted at: {video_url}")
-            except Exception as e:
-                logger.warning(f"Catbox upload failed: {e}")
+            # Method: Resumable Upload (Directly upload local file bytes to FB)
+            # This is the most reliable method as it avoids 3rd party hosts.
+            logger.info("Using Resumable Upload (Direct) for Instagram Video...")
+            init_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media"
+            init_data = {
+                'media_type': 'REELS',
+                'caption': msg,
+                'access_token': token,
+                'upload_type': 'resumable'
+            }
             
-            if video_url:
-                # Use video_url approach (simpler, more reliable)
-                logger.info("Using video_url approach for Instagram...")
-                container_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media"
-                container_data = {
-                    'media_type': 'REELS',
-                    'video_url': video_url,
-                    'caption': msg,
-                    'access_token': token
-                }
-                
-                container_resp = requests.post(container_url, data=container_data, timeout=60)
-                container_result = container_resp.json()
-                
-                if 'id' not in container_result:
-                    logger.error(f"Instagram container failed: {container_result}")
-                    return container_result
-                
-                container_id = container_result['id']
-                logger.info(f"Container created via video_url: {container_id}")
-            else:
-                # Fallback: Use resumable upload
-                logger.info("Falling back to resumable upload...")
-                init_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media"
-                init_data = {
-                    'media_type': 'REELS',
-                    'caption': msg,
-                    'access_token': token,
-                    'upload_type': 'resumable'
-                }
-                
-                init_resp = requests.post(init_url, data=init_data)
-                init_result = init_resp.json()
-                
-                if 'id' not in init_result:
-                    logger.error(f"Instagram container init failed: {init_result}")
-                    return init_result
-                
-                container_id = init_result['id']
-                logger.info(f"Container created: {container_id}")
-                
-                # Get upload URI from response
-                upload_url = init_result.get('uri', f"https://rupload.facebook.com/ig-api-upload/v22.0/{container_id}")
-                logger.info(f"Upload URL: {upload_url}")
-                
-                # Upload the video bytes with correct headers
-                headers = {
-                    'Authorization': f'OAuth {token}',
-                    'offset': '0',
-                    'file_size': str(file_size),
-                    'Content-Type': 'application/octet-stream'
-                }
-                
-                upload_resp = requests.post(upload_url, headers=headers, data=video_data, timeout=300)
-                logger.info(f"Video upload response: {upload_resp.status_code}")
-                
-                if upload_resp.status_code != 200:
-                    logger.error(f"Upload failed: {upload_resp.text}")
-                    return {'error': f'Upload failed: {upload_resp.status_code}', 'details': upload_resp.text}
-                
-                upload_result = upload_resp.json() if upload_resp.text else {}
-                logger.info(f"Upload result: {upload_result}")
+            if is_sched and sched_time:
+                init_data['scheduled_publish_time'] = sched_time
+                logger.info(f"Scheduling Instagram Reel (Resumable) for {sched_time}")
+            
+            init_resp = requests.post(init_url, data=init_data)
+            init_result = init_resp.json()
+            
+            if 'id' not in init_result:
+                logger.error(f"Instagram container init failed: {init_result}")
+                return init_result
+            
+            container_id = init_result['id']
+            logger.info(f"Container created: {container_id}")
+            
+            # Get upload URI from response
+            upload_url = init_result.get('uri', f"https://rupload.facebook.com/ig-api-upload/v22.0/{container_id}")
+            logger.info(f"Upload URL: {upload_url}")
+            
+            # Upload the video bytes with correct headers
+            headers = {
+                'Authorization': f'OAuth {token}',
+                'offset': '0',
+                'file_size': str(file_size),
+                'Content-Type': 'application/octet-stream'
+            }
+            
+            upload_resp = requests.post(upload_url, headers=headers, data=video_data, timeout=300)
+            logger.info(f"Video upload response: {upload_resp.status_code}")
+            
+            if upload_resp.status_code != 200:
+                logger.error(f"Upload failed: {upload_resp.text}")
+                return {'error': f'Upload failed: {upload_resp.status_code}', 'details': upload_resp.text}
+            
+            upload_result = upload_resp.json() if upload_resp.text else {}
+            logger.info(f"Upload result: {upload_result}")
+            
+            # Legacy 3rd party host attempts (Pixeldrain/Catbox) removed/skipped to prioritize stability
+            video_url = None 
+            
+            # if video_url: (Logic removed)
             
         else:
             # For images - Instagram requires public URL
@@ -415,35 +540,93 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
             
             image_url = None
             
-            # Try imgbb anonymous upload
-            try:
-                import base64
-                with open(media_path, 'rb') as f:
-                    image_data = base64.b64encode(f.read()).decode('utf-8')
-                
-                imgbb_url = "https://api.imgbb.com/1/upload"
-                imgbb_key = os.environ.get('IMGBB_API_KEY', '6d207e02198a847aa98d0a2a901485a5')  # Free public key
-                
-                imgbb_data = {
-                    'key': imgbb_key,
-                    'image': image_data,
-                    'expiration': 600  # 10 minutes
-                }
-                
-                imgbb_resp = requests.post(imgbb_url, data=imgbb_data, timeout=60)
-                imgbb_result = imgbb_resp.json()
-                
-                if imgbb_result.get('success'):
-                    image_url = imgbb_result['data']['url']
-                    logger.info(f"Image hosted at: {image_url}")
-                else:
-                    logger.warning(f"imgbb upload failed: {imgbb_result}")
-            except Exception as e:
-                logger.warning(f"imgbb upload error: {e}")
+            # Read image data once
+            with open(media_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            # Method: Freeimage.host (High speed, ImgBB/Chevereto compatible API)
+            # This aligns with the user's request for a fast "Developer API" service.
+            # Freeimage.host is known for speed and reliability compared to Catbox.
+            image_url = None
+            if not image_url:
+                try:
+                    logger.info("Uploading image to Freeimage.host (Fast API)...")
+                    import base64
+                    image_data = base64.b64encode(image_bytes).decode('utf-8')
+                    
+                    # Freeimage.host uses the Chevereto API (same as ImgBB)
+                    # This public key is widely available for anonymous uploads
+                    api_key = "6d207e02198a847aa98d0a2a901485a5" 
+                    
+                    upload_url = "https://freeimage.host/api/1/upload"
+                    payload = {
+                        'key': api_key,
+                        'image': image_data,
+                        'expiration': 600 # 10 minutes (sufficient for IG processing)
+                    }
+                    
+                    resp = requests.post(upload_url, data=payload, timeout=60)
+                    result = resp.json()
+                    
+                    if result.get('status_code') == 200:
+                        image_url = result['image']['url']
+                        logger.info(f"Image hosted at Freeimage.host: {image_url}")
+                    else:
+                        logger.error(f"Freeimage.host upload failed: {result}")
+                        
+                except Exception as e:
+                    logger.warning(f"Freeimage.host upload error: {e}")
+
+            # Fallback: Tmpfiles.org (Extremely fast, temporary storage)
+            if not image_url:
+                try:
+                    logger.info("Fallback: Uploading to Tmpfiles.org...")
+                    # Tmpfiles API
+                    files = {'file': image_bytes}
+                    resp = requests.post('https://tmpfiles.org/api/v1/upload', files=files, timeout=60)
+                    result = resp.json()
+                    
+                    if result.get('status') == 'success':
+                        # Convert partial URL to direct download URL
+                        # URL format: https://tmpfiles.org/12345/image.jpg -> https://tmpfiles.org/dl/12345/image.jpg
+                        raw_url = result['data']['url']
+                        direct_url = raw_url.replace('.org/', '.org/dl/')
+                        image_url = direct_url
+                        logger.info(f"Image hosted at Tmpfiles.org: {image_url}")
+                except Exception as e:
+                     logger.warning(f"Tmpfiles upload error: {e}")
+
+            # Method 2: Fallback to imgbb upload
+            if not image_url:
+                try:
+                    import base64
+                    image_data = base64.b64encode(image_bytes).decode('utf-8')
+                    
+                    imgbb_url = "https://api.imgbb.com/1/upload"
+                    imgbb_key = os.environ.get('IMGBB_API_KEY', '6d207e02198a847aa98d0a2a901485a5')  # Free public key
+                    
+                    imgbb_data = {
+                        'key': imgbb_key,
+                        'image': image_data,
+                        'expiration': 600  # 10 minutes
+                    }
+                    
+                    imgbb_resp = requests.post(imgbb_url, data=imgbb_data, timeout=60)
+                    imgbb_result = imgbb_resp.json()
+                    
+                    if imgbb_result.get('success'):
+                        image_url = imgbb_result['data']['url']
+                        logger.info(f"Image hosted at imgbb: {image_url}")
+                    else:
+                        logger.warning(f"imgbb upload failed: {imgbb_result}")
+                except Exception as e:
+                    logger.warning(f"imgbb upload error: {e}")
+            
+
             
             if not image_url:
-                logger.error("Failed to host image for Instagram - no public URL available")
-                return {'error': 'Could not host image for Instagram'}
+                logger.error("Failed to host image for Instagram - all upload services failed")
+                return {'error': 'Could not host image for Instagram - all hosting services failed'}
             
             # Create container with image URL
             container_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media"
@@ -452,6 +635,10 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
                 'caption': msg,
                 'access_token': token
             }
+            
+            if is_sched and sched_time:
+                container_data['scheduled_publish_time'] = sched_time
+                logger.info(f"Scheduling Instagram Post for {sched_time}")
             
             container_resp = requests.post(container_url, data=container_data)
             container_result = container_resp.json()
@@ -494,15 +681,17 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
             return {'error': 'Timeout waiting for media processing'}
         
         # Step 3: Publish the container
+        if is_sched and sched_time:
+            logger.info("Content scheduled - skipping immediate publish")
+            return {'id': container_id, 'scheduled': True}
+            
         logger.info("Publishing to Instagram...")
+        
         publish_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media_publish"
         publish_data = {
             'creation_id': container_id,
             'access_token': token
         }
-        
-        if is_sched and sched_time:
-            logger.warning(f"Instagram doesn't support API scheduling - posting immediately (was scheduled for {sched_time})")
         
         publish_resp = requests.post(publish_url, data=publish_data, timeout=60)
         result = publish_resp.json()
@@ -682,7 +871,6 @@ async def main_async():
     # 3. Post to Facebook & Instagram
     page_id = os.environ.get('FB_PAGE_ID') or config['facebook']['page_id']
     token = os.environ.get('FB_ACCESS_TOKEN') or config['facebook']['access_token']
-    gemini_key = os.environ.get('GEMINI_API_KEY')
     
     # Instagram config
     ig_enabled = config.get('instagram', {}).get('enabled', False)
@@ -698,16 +886,18 @@ async def main_async():
         is_video = tweet.get('has_video', False)
         media_type = "VIDEO" if is_video else "IMAGE"
         
-        # First post = immediate, rest = scheduled at 10-min intervals
+        # First post = immediate, rest = scheduled at +11 min from now
+        # Facebook requires scheduled time to be at least 10 min in the future
         if i == 0:
             is_scheduled = False
             sched_time = None
             logger.info(f"[NOW] Posting {media_type} for {item['feed_id']}...")
         else:
             is_scheduled = True
-            sched_time = base_time + (i * 600)  # 10 min intervals
-            mins = i * 10
-            logger.info(f"[SCHEDULE +{mins}min] {media_type} for {item['feed_id']}...")
+            # Each scheduled post is +20 min from current time (safe for IG/FB)
+            current_time = int(time.time())
+            sched_time = current_time + 1200  # +20 min from NOW
+            logger.info(f"[SCHEDULE +20min] {media_type} for {item['feed_id']}...")
         
         # Download media
         if is_video:
@@ -720,10 +910,8 @@ async def main_async():
             post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'status': 'failed', 'error': 'download_failed'})
             continue
         
-        # Enhance caption
+        # Build caption with hashtags
         msg = clean_text(tweet['text'])
-        logger.info("Enhancing caption...")
-        msg = enhance_caption(msg, gemini_key)
         tags = generate_hashtags(msg)
         final_msg = f"{msg}\n\n{' '.join(tags)}"
         
@@ -732,22 +920,24 @@ async def main_async():
         fb_success = 'id' in res or 'post_id' in res
         post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'facebook', 'status': 'success' if fb_success else 'failed', 'error': res.get('error')})
         
-        # Post to Instagram (all posts go immediately - no scheduling support)
+        # Prioritize Catbox for images
+        # Post to Instagram 
         ig_success = False
+        ig_res = {}
         if ig_enabled and ig_user_id:
             logger.info(f"[IG] Posting {media_type} to Instagram for {item['feed_id']}...")
-            ig_res = post_instagram(ig_user_id, ig_token, final_msg, media_path, is_video=is_video, is_sched=False, sched_time=None)
+            ig_res = post_instagram(ig_user_id, ig_token, final_msg, media_path, is_video=is_video, is_sched=is_scheduled, sched_time=sched_time)
             ig_success = 'id' in ig_res
             
-            # Check if it was skipped (e.g., video too long)
-            if ig_res.get('skipped'):
-                logger.info(f"[IG SKIP] {item['feed_id']}: {ig_res.get('error')}")
-            elif ig_success:
-                logger.info(f"[IG OK] {media_type} posted to Instagram for {item['feed_id']}")
-                post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'instagram', 'status': 'success'})
-            else:
-                logger.error(f"[IG FAIL] {item['feed_id']}: {ig_res.get('error')}")
-                post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'instagram', 'status': 'failed', 'error': ig_res.get('error')})
+        # Check if it was skipped (e.g., video too long)
+        if ig_res.get('skipped'):
+            logger.info(f"[IG SKIP] {item['feed_id']}: {ig_res.get('error')}")
+        elif ig_success:
+            logger.info(f"[IG OK] {media_type} posted to Instagram for {item['feed_id']}")
+            post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'instagram', 'status': 'success'})
+        elif ig_enabled and ig_user_id: # Only log error if we actually tried
+            logger.error(f"[IG FAIL] {item['feed_id']}: {ig_res.get('error')}")
+            post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'instagram', 'status': 'failed', 'error': ig_res.get('error')})
         
         if fb_success or ig_success:
             state['last_posted_ids'][item['feed_id']] = tweet['id']
@@ -832,6 +1022,20 @@ async def main_async():
         json.dump(cucumber_features, f, indent=2)
             
     logger.info("Bot Run Completed. Reports generated: run_report.json, cucumber_report.json")
+    
+    # Cleanup Temp Files
+    try:
+        if os.path.exists(temp_dir):
+            for file in os.listdir(temp_dir):
+                file_path = os.path.join(temp_dir, file)
+                try:
+                    if os.path.isfile(file_path):
+                        os.unlink(file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to delete {file_path}: {e}")
+            logger.info("Temp directory cleaned.")
+    except Exception as e:
+        logger.warning(f"Error cleaning temp dir: {e}")
 
 if __name__ == '__main__':
     asyncio.run(main_async())
