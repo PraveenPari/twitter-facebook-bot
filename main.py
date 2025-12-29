@@ -18,23 +18,6 @@ import yt_dlp
 from playwright.async_api import async_playwright
 import logging
 
-# Gemini AI removed - not needed
-
-# Import YouTube monitor
-try:
-    import youtube_live_monitor
-    HAS_YOUTUBE = True
-except ImportError:
-    HAS_YOUTUBE = False
-
-# Import instagrapi for trending hashtags
-try:
-    from instagrapi import Client as InstaClient
-    HAS_INSTAGRAPI = True
-except ImportError:
-    HAS_INSTAGRAPI = False
-    logger.warning("instagrapi not installed - trending hashtags feature disabled")
-
 # Configure Logging
 # Force UTF-8 for stdout on Windows to support emojis
 if sys.platform == 'win32':
@@ -52,6 +35,23 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Gemini AI removed - not needed
+
+# Import YouTube monitor
+try:
+    import youtube_live_monitor
+    HAS_YOUTUBE = True
+except ImportError:
+    HAS_YOUTUBE = False
+
+# Import instagrapi for trending hashtags
+try:
+    from instagrapi import Client as InstaClient
+    HAS_INSTAGRAPI = True
+except ImportError:
+    HAS_INSTAGRAPI = False
+    logger.warning("instagrapi not installed - trending hashtags feature disabled")
 
 def load_config():
     if os.path.exists('config.json'):
