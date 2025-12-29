@@ -400,16 +400,24 @@ def post_facebook(page_id, token, msg, media_path=None, is_video=False, is_sched
     files = {}
     
     if media_path:
-        if is_video:
-            url = url.replace('/feed', '/videos')
-            data['description'] = msg
-            files = {'source': open(media_path, 'rb')}
-            logger.info(f"Posting VIDEO to Facebook...")
-        else:
-            url = url.replace('/feed', '/photos')
-            data['caption'] = msg
-            files = {'source': open(media_path, 'rb')}
-            logger.info(f"Posting IMAGE to Facebook...")
+        if not os.path.exists(media_path):
+             logger.error(f"Media file not found: {media_path} - Skipping Facebook post")
+             return {'error': 'Media file missing'}
+             
+        try:
+            if is_video:
+                url = url.replace('/feed', '/videos')
+                data['description'] = msg
+                files = {'source': open(media_path, 'rb')}
+                logger.info(f"Posting VIDEO to Facebook...")
+            else:
+                url = url.replace('/feed', '/photos')
+                data['caption'] = msg
+                files = {'source': open(media_path, 'rb')}
+                logger.info(f"Posting IMAGE to Facebook...")
+        except Exception as e:
+            logger.error(f"Error opening media file: {e}")
+            return {'error': f"File error: {e}"}
     else:
         logger.info(f"Posting TEXT to Facebook...")
             
@@ -943,7 +951,8 @@ async def main_async():
             state['last_posted_ids'][item['feed_id']] = tweet['id']
             save_state(state)
             if is_scheduled:
-                logger.info(f"[OK] FB scheduled, IG posted for {item['feed_id']}")
+                ig_status_str = "posted" if ig_success else "failed/skipped"
+                logger.info(f"[OK] FB scheduled, IG {ig_status_str} for {item['feed_id']}")
             else:
                 logger.info(f"[OK] {media_type} posted for {item['feed_id']}")
             
@@ -1021,9 +1030,7 @@ async def main_async():
     with open('cucumber_report.json', 'w') as f:
         json.dump(cucumber_features, f, indent=2)
             
-    logger.info("Bot Run Completed. Reports generated: run_report.json, cucumber_report.json")
-    
-    # Cleanup Temp Files
+    # Cleanup Temp Files (Now inside the function where temp_dir is defined)
     try:
         if os.path.exists(temp_dir):
             for file in os.listdir(temp_dir):
@@ -1036,6 +1043,8 @@ async def main_async():
             logger.info("Temp directory cleaned.")
     except Exception as e:
         logger.warning(f"Error cleaning temp dir: {e}")
+
+    logger.info("Bot Run Completed. Reports generated: run_report.json, cucumber_report.json")
 
 if __name__ == '__main__':
     asyncio.run(main_async())
