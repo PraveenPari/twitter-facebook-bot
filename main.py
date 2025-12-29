@@ -278,6 +278,248 @@ def post_facebook(page_id, token, msg, media_path=None, is_video=False, is_sched
         logger.error(f"Facebook Request Failed: {e}")
         return {'error': str(e)}
 
+def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_sched=False, sched_time=None):
+    """Post content to Instagram using Graph API with proper container flow"""
+    if not media_path:
+        logger.warning("Instagram requires media - skipping text-only post")
+        return {'error': 'Instagram requires media'}
+    
+    try:
+        container_id = None
+        
+        # Step 1: Create media container
+        if is_video:
+            logger.info(f"Creating Instagram VIDEO (Reel) container...")
+            
+            # Check video duration first (max 5 minutes for Instagram Reels via this bot)
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+                     '-of', 'default=noprint_wrappers=1:nokey=1', media_path],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    duration = float(result.stdout.strip())
+                    logger.info(f"Video duration: {duration:.1f} seconds ({duration/60:.1f} minutes)")
+                    
+                    # Skip Instagram for videos over 5 minutes (300 seconds)
+                    if duration > 300:
+                        logger.warning(f"Video too long for Instagram Reels: {duration/60:.1f} minutes (max 5 min) - SKIPPING Instagram")
+                        return {'error': 'Video too long for Instagram (max 5 minutes)', 'skipped': True}
+            except FileNotFoundError:
+                logger.warning("ffprobe not found - skipping duration check")
+            except Exception as e:
+                logger.warning(f"Could not check video duration: {e}")
+            
+            # Read the video file
+            with open(media_path, 'rb') as f:
+                video_data = f.read()
+            
+            file_size = len(video_data)
+            logger.info(f"Video file size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
+            
+            # Check video file size (max 300MB for Reels)
+            if file_size > 300 * 1024 * 1024:
+                logger.error(f"Video too large for Instagram: {file_size / 1024 / 1024:.2f} MB (max 300MB)")
+                return {'error': 'Video too large for Instagram (max 300MB)'}
+            
+            # Method 1: Try uploading video to catbox.moe and use video_url approach
+            video_url = None
+            try:
+                logger.info("Uploading video to catbox.moe for Instagram...")
+                catbox_url = "https://catbox.moe/user/api.php"
+                files = {
+                    'fileToUpload': ('video.mp4', video_data, 'video/mp4')
+                }
+                data = {
+                    'reqtype': 'fileupload'
+                }
+                catbox_resp = requests.post(catbox_url, files=files, data=data, timeout=120)
+                if catbox_resp.status_code == 200 and catbox_resp.text.startswith('https://'):
+                    video_url = catbox_resp.text.strip()
+                    logger.info(f"Video hosted at: {video_url}")
+            except Exception as e:
+                logger.warning(f"Catbox upload failed: {e}")
+            
+            if video_url:
+                # Use video_url approach (simpler, more reliable)
+                logger.info("Using video_url approach for Instagram...")
+                container_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media"
+                container_data = {
+                    'media_type': 'REELS',
+                    'video_url': video_url,
+                    'caption': msg,
+                    'access_token': token
+                }
+                
+                container_resp = requests.post(container_url, data=container_data, timeout=60)
+                container_result = container_resp.json()
+                
+                if 'id' not in container_result:
+                    logger.error(f"Instagram container failed: {container_result}")
+                    return container_result
+                
+                container_id = container_result['id']
+                logger.info(f"Container created via video_url: {container_id}")
+            else:
+                # Fallback: Use resumable upload
+                logger.info("Falling back to resumable upload...")
+                init_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media"
+                init_data = {
+                    'media_type': 'REELS',
+                    'caption': msg,
+                    'access_token': token,
+                    'upload_type': 'resumable'
+                }
+                
+                init_resp = requests.post(init_url, data=init_data)
+                init_result = init_resp.json()
+                
+                if 'id' not in init_result:
+                    logger.error(f"Instagram container init failed: {init_result}")
+                    return init_result
+                
+                container_id = init_result['id']
+                logger.info(f"Container created: {container_id}")
+                
+                # Get upload URI from response
+                upload_url = init_result.get('uri', f"https://rupload.facebook.com/ig-api-upload/v22.0/{container_id}")
+                logger.info(f"Upload URL: {upload_url}")
+                
+                # Upload the video bytes with correct headers
+                headers = {
+                    'Authorization': f'OAuth {token}',
+                    'offset': '0',
+                    'file_size': str(file_size),
+                    'Content-Type': 'application/octet-stream'
+                }
+                
+                upload_resp = requests.post(upload_url, headers=headers, data=video_data, timeout=300)
+                logger.info(f"Video upload response: {upload_resp.status_code}")
+                
+                if upload_resp.status_code != 200:
+                    logger.error(f"Upload failed: {upload_resp.text}")
+                    return {'error': f'Upload failed: {upload_resp.status_code}', 'details': upload_resp.text}
+                
+                upload_result = upload_resp.json() if upload_resp.text else {}
+                logger.info(f"Upload result: {upload_result}")
+            
+        else:
+            # For images - Instagram requires public URL
+            logger.info(f"Creating Instagram IMAGE container...")
+            
+            # Option 1: Try using imgbb.com free hosting (no API key needed for anon uploads)
+            # Option 2: Use catbox.moe or other free hosts
+            # Option 3: Try to extract URL from Facebook upload
+            
+            image_url = None
+            
+            # Try imgbb anonymous upload
+            try:
+                import base64
+                with open(media_path, 'rb') as f:
+                    image_data = base64.b64encode(f.read()).decode('utf-8')
+                
+                imgbb_url = "https://api.imgbb.com/1/upload"
+                imgbb_key = os.environ.get('IMGBB_API_KEY', '6d207e02198a847aa98d0a2a901485a5')  # Free public key
+                
+                imgbb_data = {
+                    'key': imgbb_key,
+                    'image': image_data,
+                    'expiration': 600  # 10 minutes
+                }
+                
+                imgbb_resp = requests.post(imgbb_url, data=imgbb_data, timeout=60)
+                imgbb_result = imgbb_resp.json()
+                
+                if imgbb_result.get('success'):
+                    image_url = imgbb_result['data']['url']
+                    logger.info(f"Image hosted at: {image_url}")
+                else:
+                    logger.warning(f"imgbb upload failed: {imgbb_result}")
+            except Exception as e:
+                logger.warning(f"imgbb upload error: {e}")
+            
+            if not image_url:
+                logger.error("Failed to host image for Instagram - no public URL available")
+                return {'error': 'Could not host image for Instagram'}
+            
+            # Create container with image URL
+            container_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media"
+            container_data = {
+                'image_url': image_url,
+                'caption': msg,
+                'access_token': token
+            }
+            
+            container_resp = requests.post(container_url, data=container_data)
+            container_result = container_resp.json()
+            
+            if 'id' not in container_result:
+                logger.error(f"Instagram container failed: {container_result}")
+                return container_result
+            
+            container_id = container_result['id']
+            logger.info(f"Image container created: {container_id}")
+        
+        # Step 2: Wait for container to be ready
+        logger.info("Waiting for Instagram media processing...")
+        max_wait = 60 if not is_video else 30  # More retries for video
+        
+        for attempt in range(max_wait):
+            status_url = f"https://graph.facebook.com/v22.0/{container_id}"
+            status_resp = requests.get(status_url, params={
+                'fields': 'status_code,status',
+                'access_token': token
+            }, timeout=30)
+            status = status_resp.json()
+            
+            status_code = status.get('status_code', '')
+            logger.info(f"Container status [{attempt+1}/{max_wait}]: {status_code}")
+            
+            if status_code == 'FINISHED':
+                logger.info("Instagram media ready for publishing!")
+                break
+            elif status_code == 'ERROR':
+                error_msg = status.get('status', 'Unknown error')
+                logger.error(f"Instagram processing failed: {error_msg}")
+                return {'error': error_msg, 'status': status}
+            elif status_code == 'IN_PROGRESS':
+                time.sleep(5)  # Wait 5 seconds before next check
+            else:
+                time.sleep(3)  # Unknown status, wait a bit
+        else:
+            logger.error("Timeout waiting for Instagram media processing")
+            return {'error': 'Timeout waiting for media processing'}
+        
+        # Step 3: Publish the container
+        logger.info("Publishing to Instagram...")
+        publish_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media_publish"
+        publish_data = {
+            'creation_id': container_id,
+            'access_token': token
+        }
+        
+        if is_sched and sched_time:
+            logger.warning(f"Instagram doesn't support API scheduling - posting immediately (was scheduled for {sched_time})")
+        
+        publish_resp = requests.post(publish_url, data=publish_data, timeout=60)
+        result = publish_resp.json()
+        
+        if 'id' in result:
+            logger.info(f"Instagram Post Success: {result}")
+        else:
+            logger.error(f"Instagram Post Failed: {result}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Instagram Request Failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {'error': str(e)}
+
 async def main_async():
     logger.info("="*60)
     logger.info("Bot Started: Playwright (Failover Nitter) + YouTube Live")
@@ -296,9 +538,9 @@ async def main_async():
     # 2. Check Twitter (Nitter)
     logger.info("Starting Playwright Browser...")
     async with async_playwright() as p:
-        # Launch with arguments to avoid detection
+        # Launch in headless mode for deployment
         browser = await p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
@@ -308,7 +550,6 @@ async def main_async():
         
         # Create ONE shared context for all tabs
         context = await browser.new_context(
-            record_video_dir="debug_videos",
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={'width': 1920, 'height': 1080},
             locale='en-US'
@@ -438,10 +679,15 @@ async def main_async():
     
     logger.info(f"[QUEUE] {len(video_posts)} videos + {len(image_posts)} images = {len(all_posts)} total")
     
-    # 3. Post to Facebook
+    # 3. Post to Facebook & Instagram
     page_id = os.environ.get('FB_PAGE_ID') or config['facebook']['page_id']
     token = os.environ.get('FB_ACCESS_TOKEN') or config['facebook']['access_token']
     gemini_key = os.environ.get('GEMINI_API_KEY')
+    
+    # Instagram config
+    ig_enabled = config.get('instagram', {}).get('enabled', False)
+    ig_user_id = os.environ.get('IG_USER_ID') or config.get('instagram', {}).get('user_id')
+    ig_token = os.environ.get('IG_ACCESS_TOKEN') or config.get('instagram', {}).get('access_token')
     
     base_time = int(time.time())
     
@@ -483,13 +729,31 @@ async def main_async():
         
         # Post to Facebook
         res = post_facebook(page_id, token, final_msg, media_path, is_video=is_video, is_sched=is_scheduled, sched_time=sched_time)
-        post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'status': 'success' if 'id' in res or 'post_id' in res else 'failed', 'error': res.get('error')})
+        fb_success = 'id' in res or 'post_id' in res
+        post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'facebook', 'status': 'success' if fb_success else 'failed', 'error': res.get('error')})
         
-        if 'id' in res or 'post_id' in res:
+        # Post to Instagram (all posts go immediately - no scheduling support)
+        ig_success = False
+        if ig_enabled and ig_user_id:
+            logger.info(f"[IG] Posting {media_type} to Instagram for {item['feed_id']}...")
+            ig_res = post_instagram(ig_user_id, ig_token, final_msg, media_path, is_video=is_video, is_sched=False, sched_time=None)
+            ig_success = 'id' in ig_res
+            
+            # Check if it was skipped (e.g., video too long)
+            if ig_res.get('skipped'):
+                logger.info(f"[IG SKIP] {item['feed_id']}: {ig_res.get('error')}")
+            elif ig_success:
+                logger.info(f"[IG OK] {media_type} posted to Instagram for {item['feed_id']}")
+                post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'instagram', 'status': 'success'})
+            else:
+                logger.error(f"[IG FAIL] {item['feed_id']}: {ig_res.get('error')}")
+                post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'instagram', 'status': 'failed', 'error': ig_res.get('error')})
+        
+        if fb_success or ig_success:
             state['last_posted_ids'][item['feed_id']] = tweet['id']
             save_state(state)
             if is_scheduled:
-                logger.info(f"[OK] {media_type} scheduled for {item['feed_id']}")
+                logger.info(f"[OK] FB scheduled, IG posted for {item['feed_id']}")
             else:
                 logger.info(f"[OK] {media_type} posted for {item['feed_id']}")
             

@@ -1,4 +1,4 @@
-name: Twitter to Facebook Bot
+name: Twitter to Facebook & Instagram Bot
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
-  post-to-facebook:
+  post-to-social:
     runs-on: ubuntu-latest
     
     steps:
@@ -18,6 +18,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
       
       - name: Install dependencies
         run: |
@@ -43,13 +48,15 @@ jobs:
         env:
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: |
           # Create config from secret
           echo "$CONFIG_JSON" > config.json
           
-          # Run the bot
+          # Run the bot with virtual display
           xvfb-run --auto-servernum python main.py
 
       - name: Upload Debug Artifacts
@@ -59,11 +66,10 @@ jobs:
           name: debug-artifacts
           path: |
             bot_run.log
-            debug_shot_*.png
-            debug_videos/
             state.json
             run_report.json
             cucumber_report.json
+          retention-days: 7
       
       - name: Upload state to Gist
         if: always()
