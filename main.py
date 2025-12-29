@@ -373,12 +373,24 @@ def download_media(url, is_video=False):
             logger.info(f"Downloading video from {tweet_url}...")
             
             out_tmpl = os.path.join(temp_dir, '%(id)s.%(ext)s')
-            ydl_opts = {'format': 'best[ext=mp4]', 'outtmpl': out_tmpl, 'quiet':True}
+            ydl_opts = {'format': 'bestv+besta/best', 'outtmpl': out_tmpl, 'quiet':True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(tweet_url, download=True)
                 if info:
-                    vid_id = info['id']
-                    path = os.path.join(temp_dir, f"{vid_id}.mp4")
+                     # Get actual filename
+                    path = ydl.prepare_filename(info)
+                    
+                    # Sanity check: does it exist?
+                    if not os.path.exists(path):
+                         # Try finding it by ID if prepare_filename is slightly off (e.g. mkv vs mp4)
+                        vid_id = info['id']
+                        potential_files = [f for f in os.listdir(temp_dir) if vid_id in f]
+                        if potential_files:
+                            path = os.path.join(temp_dir, potential_files[0])
+                        else:
+                            logger.error(f"Downloaded file not found for ID {vid_id}")
+                            return None
+
                     logger.info(f"Video downloaded: {path}")
                     return path
         else:
@@ -445,6 +457,10 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
     if not media_path:
         logger.warning("Instagram requires media - skipping text-only post")
         return {'error': 'Instagram requires media'}
+        
+    if not os.path.exists(media_path):
+        logger.error(f"Media file not found for Instagram: {media_path} - Skipping")
+        return {'error': 'Media file missing'}
     
     try:
         container_id = None
