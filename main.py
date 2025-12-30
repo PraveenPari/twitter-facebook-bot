@@ -367,18 +367,18 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
                 logger.warning(f"Could not check video duration: {e} - defaulting to REELS")
             
             # Determine media type based on duration:
-            # - REELS: 3 seconds to 90 seconds (Instagram Reels)
-            # - VIDEO: 90 seconds to 60 minutes (Instagram Video/IGTV)
-            # - Skip: Over 60 minutes
+            # Instagram deprecated VIDEO type in 2024 - ALL videos must now use REELS
+            # - REELS: 3 seconds to 15 minutes (was 90 seconds, now extended)
+            # - Skip: Over 15 minutes
             
             if video_duration is not None:
-                if video_duration > 3600:  # Over 60 minutes
-                    logger.warning(f"Video too long for Instagram: {video_duration/60:.1f} minutes (max 60 min) - SKIPPING Instagram")
-                    return {'error': 'Video too long for Instagram (max 60 minutes)', 'skipped': True}
-                elif video_duration > 90:  # 90 seconds to 60 minutes - use VIDEO type
-                    media_type = 'VIDEO'
-                    logger.info(f"Creating Instagram VIDEO container (duration: {video_duration:.1f}s)...")
-                else:  # Under 90 seconds - use REELS
+                if video_duration > 900:  # Over 15 minutes (REELS max)
+                    logger.warning(f"Video too long for Instagram REELS: {video_duration/60:.1f} minutes (max 15 min) - SKIPPING Instagram")
+                    return {'error': 'Video too long for Instagram REELS (max 15 minutes)', 'skipped': True}
+                elif video_duration < 3:  # Under 3 seconds
+                    logger.warning(f"Video too short for Instagram REELS: {video_duration:.1f}s (min 3s) - SKIPPING Instagram")
+                    return {'error': 'Video too short for Instagram REELS (min 3 seconds)', 'skipped': True}
+                else:
                     media_type = 'REELS'
                     logger.info(f"Creating Instagram REELS container (duration: {video_duration:.1f}s)...")
             else:
@@ -393,11 +393,11 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
             file_size = len(video_data)
             logger.info(f"Video file size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
             
-            # Check video file size (max 1GB for VIDEO, 300MB for REELS)
-            max_size_mb = 1000 if media_type == 'VIDEO' else 300
+            # Check video file size (max 1GB for REELS)
+            max_size_mb = 1000
             if file_size > max_size_mb * 1024 * 1024:
-                logger.error(f"Video too large for Instagram {media_type}: {file_size / 1024 / 1024:.2f} MB (max {max_size_mb}MB)")
-                return {'error': f'Video too large for Instagram {media_type} (max {max_size_mb}MB)'}
+                logger.error(f"Video too large for Instagram REELS: {file_size / 1024 / 1024:.2f} MB (max {max_size_mb}MB)")
+                return {'error': f'Video too large for Instagram REELS (max {max_size_mb}MB)'}
             
             # Method: Resumable Upload (Directly upload local file bytes to FB)
             # This is the most reliable method as it avoids 3rd party hosts.
