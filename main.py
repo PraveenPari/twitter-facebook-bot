@@ -647,7 +647,7 @@ async def main_async():
     async with async_playwright() as p:
         # Launch in headless mode for deployment
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
