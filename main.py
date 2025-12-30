@@ -45,13 +45,6 @@ try:
 except ImportError:
     HAS_YOUTUBE = False
 
-# Import instagrapi for trending hashtags
-try:
-    from instagrapi import Client as InstaClient
-    HAS_INSTAGRAPI = True
-except ImportError:
-    HAS_INSTAGRAPI = False
-    logger.warning("instagrapi not installed - trending hashtags feature disabled")
 
 def load_config():
     if os.path.exists('config.json'):
@@ -92,163 +85,19 @@ def clean_text(text):
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-# TVK Hashtags (Shortened) - Static fallback hashtags
-TVK_HASHTAGS = ["#TVK", "#ThamizhagaVetriKazhagam", "#ThalapathyVijay", "#TamilNadu"]
+# Fixed TVK Hashtags - 25 hashtags for all posts
+TVK_HASHTAGS = [
+    "#TVK", "#ThamizhagaVetriKazhagam", "#ThalapathyVijay", "#TamilNadu",
+    "#tvkvijayofficial", "#tvkvijay", "#tvkfortn", "#tvkmaanadu", "#tvkvijayspeech",
+    "#tvkvijayhq", "#actorvijay", "#actorvijayfansclub", "#actorvijayteam",
+    "#actorvijayofficial", "#actorvijayanna", "#Vijay", "#VijayPolitics",
+    "#TNPolitics", "#TamilNadu2026", "#VijayForCM", "#TamilPolitics",
+    "#VijayFans", "#VijayArmy", "#ThalapathyForever", "#TVKParty"
+]
 
-# Cache for trending hashtags (refreshed each run)
-_trending_hashtags_cache = None
-
-def fetch_trending_hashtags_from_instagram(ig_username=None, ig_password=None):
-    """
-    Fetch real-time trending hashtags from TVK, TVKVijay, actorvijay Instagram.
-    Uses search_hashtags API which returns related trending tags.
-    """
-    global _trending_hashtags_cache
-    
-    if _trending_hashtags_cache is not None:
-        return _trending_hashtags_cache
-    
-    if not HAS_INSTAGRAPI:
-        logger.warning("instagrapi not available - using static hashtags")
-        return TVK_HASHTAGS
-    
-    # Get Instagram credentials from: 1) Function args, 2) Environment, 3) Config file
-    config = {}
-    try:
-        config = load_config()
-    except:
-        pass
-    
-    instagrapi_config = config.get('instagrapi', {})
-    
-    username = ig_username or os.environ.get('IG_SCRAPE_USERNAME') or instagrapi_config.get('username')
-    password = ig_password or os.environ.get('IG_SCRAPE_PASSWORD') or instagrapi_config.get('password')
-    
-    if not username or not password:
-        logger.warning("Instagram credentials not provided - using static hashtags")
-        return TVK_HASHTAGS
-    
-    SESSION_FILE = "ig_session.json"
-    
-    try:
-        logger.info("Fetching trending hashtags from Instagram...")
-        cl = InstaClient()
-        cl.delay_range = [1, 3]
-        
-        # Try to reuse existing session for faster login
-        if os.path.exists(SESSION_FILE):
-            try:
-                cl.load_settings(SESSION_FILE)
-                cl.login(username, password)
-                logger.info("Instagram session reused")
-            except:
-                cl = InstaClient()
-                cl.login(username, password)
-                cl.dump_settings(SESSION_FILE)
-                logger.info("Fresh Instagram login")
-        else:
-            cl.login(username, password)
-            cl.dump_settings(SESSION_FILE)
-            logger.info("Instagram login successful")
-        
-        # Hashtags to search for related trending tags
-        search_terms = ['TVK', 'TVKVijay', 'actorvijay', 'ThalapathyVijay', 'Vijay']
-        
-        all_hashtags = []
-        
-        for term in search_terms:
-            try:
-                logger.info(f"Searching related hashtags for #{term}...")
-                
-                # search_hashtags returns list of related/trending hashtags
-                results = cl.search_hashtags(term)
-                
-                for hashtag in results[:10]:  # Take top 10 related
-                    # Clean the hashtag name (remove emojis/special chars for cleaner look)
-                    tag_name = hashtag.name
-                    # Keep alphanumeric and some unicode chars
-                    all_hashtags.append('#' + tag_name)
-                
-                logger.info(f"Found {len(results)} related hashtags for #{term}")
-                time.sleep(1)  # Small delay
-                
-            except Exception as e:
-                logger.warning(f"Failed to search #{term}: {e}")
-                continue
-        
-        # Count and deduplicate
-        from collections import Counter
-        hashtag_counts = Counter(all_hashtags)
-        
-        # Get unique tags, prioritizing most common
-        trending = [tag for tag, count in hashtag_counts.most_common(30)]
-        
-        # Clean hashtags - only keep English alphanumeric hashtags
-        clean_trending = []
-        
-        # Words to exclude from hashtags (negative/inappropriate content)
-        excluded_words = ['stampede', 'sethu', 'devar', 'death', 'dead', 'kill', 'accident', 'tragedy', 'rip']
-        
-        for tag in trending:
-            # Remove the # for checking
-            tag_text = tag[1:] if tag.startswith('#') else tag
-            
-            # Only keep hashtags that are purely ASCII alphanumeric (English letters + numbers)
-            # This removes hashtags with special chars like ü, ş, ä, emojis, etc.
-            if not (tag_text.isascii() and tag_text.isalnum()):
-                continue
-            
-            # Exclude hashtags containing negative words
-            tag_lower = tag_text.lower()
-            if any(word in tag_lower for word in excluded_words):
-                logger.info(f"Excluding hashtag with negative word: #{tag_text}")
-                continue
-            
-            clean_trending.append('#' + tag_text)
-        
-        # Add core TVK hashtags at the beginning
-        core_tags = ['#TVK', '#ThamizhagaVetriKazhagam', '#ThalapathyVijay', '#TamilNadu']
-        final_trending = core_tags + [t for t in clean_trending if t.lower() not in [c.lower() for c in core_tags]]
-        
-        # Fallback hashtags if not enough trending ones found
-        fallback_hashtags = [
-            '#Vijay', '#VijayPolitics', '#TNPolitics', '#TamilNadu2026',
-            '#VijayForCM', '#Tamilnadu', '#TamilPolitics', '#VijayFans',
-            '#VijayArmy', '#ThalapathyForever', '#TVKParty'
-        ]
-        
-        # Ensure we have exactly 25 hashtags
-        while len(final_trending) < 25 and fallback_hashtags:
-            fb_tag = fallback_hashtags.pop(0)
-            if fb_tag.lower() not in [t.lower() for t in final_trending]:
-                final_trending.append(fb_tag)
-        
-        logger.info(f"Trending hashtags ({len(final_trending)}): {final_trending[:10]}")
-        
-        # Cache the result - exactly 25 hashtags
-        _trending_hashtags_cache = final_trending[:25]
-        
-        return _trending_hashtags_cache
-        
-    except Exception as e:
-        logger.error(f"Failed to fetch trending hashtags: {e}")
-        return TVK_HASHTAGS
-
-def generate_hashtags(content, use_trending=True):
-    """
-    Generate hashtags - combines trending hashtags with content-based ones.
-    """
-    if use_trending:
-        tags = fetch_trending_hashtags_from_instagram()
-    else:
-        tags = TVK_HASHTAGS.copy()
-    
-    # Add content-based hashtags
-    if 'election' in content.lower(): 
-        tags.insert(0, "#TNElection2026")
-    
-    # Return exactly 25 hashtags
-    return tags[:25]
+def generate_hashtags(content=None):
+    """Return the fixed 25 TVK hashtags for all posts."""
+    return TVK_HASHTAGS.copy()
 
 # Caption enhancement removed - using original caption
 
@@ -371,10 +220,10 @@ def download_media(url, is_video=False):
                 tweet_url = url
                 
             logger.info(f"Downloading video from {tweet_url}...")
-            
             # Force compatible format (mp4/h264) for Instagram/Facebook
             out_tmpl = os.path.join(temp_dir, '%(id)s.%(ext)s')
-            # 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' 
+            # 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' l
+            
             # This prioritizes mp4 containers which are safest for Graph API
             ydl_opts = {
                 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', 
@@ -416,29 +265,38 @@ def download_media(url, is_video=False):
     return None
 
 def post_facebook(page_id, token, msg, media_path=None, is_video=False, is_sched=False, sched_time=None):
+    """Post content to Facebook with proper file handling"""
     url = f"https://graph.facebook.com/v22.0/{page_id}/feed"
     data = {'message': msg, 'access_token': token}
-    files = {}
+    file_handle = None
     
     if media_path:
         if not os.path.exists(media_path):
-             logger.error(f"Media file not found: {media_path} - Skipping Facebook post")
-             return {'error': 'Media file missing'}
+            logger.error(f"Media file not found: {media_path} - Skipping Facebook post")
+            return {'error': 'Media file missing'}
+        
+        # Check file size
+        file_size = os.path.getsize(media_path)
+        logger.info(f"Media file size: {file_size / 1024 / 1024:.2f} MB")
              
         try:
             if is_video:
                 url = url.replace('/feed', '/videos')
                 data['description'] = msg
-                files = {'source': open(media_path, 'rb')}
+                # Remove 'message' as videos use 'description'
+                if 'message' in data:
+                    del data['message']
                 logger.info(f"Posting VIDEO to Facebook...")
             else:
                 url = url.replace('/feed', '/photos')
                 data['caption'] = msg
-                files = {'source': open(media_path, 'rb')}
+                # Remove 'message' as photos use 'caption'
+                if 'message' in data:
+                    del data['message']
                 logger.info(f"Posting IMAGE to Facebook...")
         except Exception as e:
-            logger.error(f"Error opening media file: {e}")
-            return {'error': f"File error: {e}"}
+            logger.error(f"Error preparing media upload: {e}")
+            return {'error': f"Preparation error: {e}"}
     else:
         logger.info(f"Posting TEXT to Facebook...")
             
@@ -448,17 +306,32 @@ def post_facebook(page_id, token, msg, media_path=None, is_video=False, is_sched
         logger.info(f"Scheduling post for {sched_time}")
         
     try:
-        if files: r = requests.post(url, data=data, files=files)
-        else: r = requests.post(url, data=data)
+        if media_path:
+            # Use context manager for proper file handling
+            with open(media_path, 'rb') as file_handle:
+                files = {'source': file_handle}
+                timeout_seconds = 600 if is_video else 120  # 10 min for video, 2 min for image
+                r = requests.post(url, data=data, files=files, timeout=timeout_seconds)
+        else:
+            r = requests.post(url, data=data, timeout=60)
         
         res = r.json()
         if 'error' in res:
-             logger.error(f"Facebook API Error: {res['error']}")
+            error_msg = res.get('error', {})
+            if isinstance(error_msg, dict):
+                logger.error(f"Facebook API Error: Code={error_msg.get('code')} Type={error_msg.get('type')} Message={error_msg.get('message')}")
+            else:
+                logger.error(f"Facebook API Error: {error_msg}")
         else:
-             logger.info(f"Facebook Post Success: {res}")
+            logger.info(f"Facebook Post Success: {res}")
         return res
+    except requests.exceptions.Timeout:
+        logger.error(f"Facebook Request Timeout (media too large or slow connection)")
+        return {'error': 'Request timeout'}
     except Exception as e:
         logger.error(f"Facebook Request Failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return {'error': str(e)}
 
 def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_sched=False, sched_time=None):
@@ -476,9 +349,8 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
         
         # Step 1: Create media container
         if is_video:
-            logger.info(f"Creating Instagram VIDEO (Reel) container...")
-            
-            # Check video duration first (max 5 minutes for Instagram Reels via this bot)
+            # Check video duration first to determine media type
+            video_duration = None
             try:
                 import subprocess
                 result = subprocess.run(
@@ -487,17 +359,32 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
                     capture_output=True, text=True, timeout=30
                 )
                 if result.returncode == 0:
-                    duration = float(result.stdout.strip())
-                    logger.info(f"Video duration: {duration:.1f} seconds ({duration/60:.1f} minutes)")
-                    
-                    # Skip Instagram for videos over 5 minutes (300 seconds)
-                    if duration > 300:
-                        logger.warning(f"Video too long for Instagram Reels: {duration/60:.1f} minutes (max 5 min) - SKIPPING Instagram")
-                        return {'error': 'Video too long for Instagram (max 5 minutes)', 'skipped': True}
+                    video_duration = float(result.stdout.strip())
+                    logger.info(f"Video duration: {video_duration:.1f} seconds ({video_duration/60:.1f} minutes)")
             except FileNotFoundError:
-                logger.warning("ffprobe not found - skipping duration check")
+                logger.warning("ffprobe not found - defaulting to REELS")
             except Exception as e:
-                logger.warning(f"Could not check video duration: {e}")
+                logger.warning(f"Could not check video duration: {e} - defaulting to REELS")
+            
+            # Determine media type based on duration:
+            # - REELS: 3 seconds to 90 seconds (Instagram Reels)
+            # - VIDEO: 90 seconds to 60 minutes (Instagram Video/IGTV)
+            # - Skip: Over 60 minutes
+            
+            if video_duration is not None:
+                if video_duration > 3600:  # Over 60 minutes
+                    logger.warning(f"Video too long for Instagram: {video_duration/60:.1f} minutes (max 60 min) - SKIPPING Instagram")
+                    return {'error': 'Video too long for Instagram (max 60 minutes)', 'skipped': True}
+                elif video_duration > 90:  # 90 seconds to 60 minutes - use VIDEO type
+                    media_type = 'VIDEO'
+                    logger.info(f"Creating Instagram VIDEO container (duration: {video_duration:.1f}s)...")
+                else:  # Under 90 seconds - use REELS
+                    media_type = 'REELS'
+                    logger.info(f"Creating Instagram REELS container (duration: {video_duration:.1f}s)...")
+            else:
+                # Default to REELS if we couldn't determine duration
+                media_type = 'REELS'
+                logger.info(f"Creating Instagram REELS container (duration unknown)...")
             
             # Read the video file
             with open(media_path, 'rb') as f:
@@ -506,17 +393,18 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
             file_size = len(video_data)
             logger.info(f"Video file size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
             
-            # Check video file size (max 300MB for Reels)
-            if file_size > 300 * 1024 * 1024:
-                logger.error(f"Video too large for Instagram: {file_size / 1024 / 1024:.2f} MB (max 300MB)")
-                return {'error': 'Video too large for Instagram (max 300MB)'}
+            # Check video file size (max 1GB for VIDEO, 300MB for REELS)
+            max_size_mb = 1000 if media_type == 'VIDEO' else 300
+            if file_size > max_size_mb * 1024 * 1024:
+                logger.error(f"Video too large for Instagram {media_type}: {file_size / 1024 / 1024:.2f} MB (max {max_size_mb}MB)")
+                return {'error': f'Video too large for Instagram {media_type} (max {max_size_mb}MB)'}
             
             # Method: Resumable Upload (Directly upload local file bytes to FB)
             # This is the most reliable method as it avoids 3rd party hosts.
-            logger.info("Using Resumable Upload (Direct) for Instagram Video...")
+            logger.info(f"Using Resumable Upload (Direct) for Instagram {media_type}...")
             init_url = f"https://graph.facebook.com/v22.0/{ig_user_id}/media"
             init_data = {
-                'media_type': 'REELS',
+                'media_type': media_type,
                 'caption': msg,
                 'access_token': token,
                 'upload_type': 'resumable'
@@ -524,7 +412,7 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
             
             if is_sched and sched_time:
                 init_data['scheduled_publish_time'] = sched_time
-                logger.info(f"Scheduling Instagram Reel (Resumable) for {sched_time}")
+                logger.info(f"Scheduling Instagram {media_type} (Resumable) for {sched_time}")
             
             init_resp = requests.post(init_url, data=init_data)
             init_result = init_resp.json()
@@ -548,7 +436,7 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
                 'Content-Type': 'application/octet-stream'
             }
             
-            upload_resp = requests.post(upload_url, headers=headers, data=video_data, timeout=300)
+            upload_resp = requests.post(upload_url, headers=headers, data=video_data, timeout=600)
             logger.info(f"Video upload response: {upload_resp.status_code}")
             
             if upload_resp.status_code != 200:
@@ -557,11 +445,6 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
             
             upload_result = upload_resp.json() if upload_resp.text else {}
             logger.info(f"Upload result: {upload_result}")
-            
-            # Legacy 3rd party host attempts (Pixeldrain/Catbox) removed/skipped to prioritize stability
-            video_url = None 
-            
-            # if video_url: (Logic removed)
             
         else:
             # For images - Instagram requires public URL
@@ -747,6 +630,8 @@ async def main_async():
     logger.info("Bot Started: Playwright (Failover Nitter) + YouTube Live")
     logger.info("="*60)
     
+    temp_dir = tempfile.gettempdir()
+    
     config = load_config()
     state = load_state()
     
@@ -762,7 +647,7 @@ async def main_async():
     async with async_playwright() as p:
         # Launch in headless mode for deployment
         browser = await p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
@@ -959,7 +844,10 @@ async def main_async():
         ig_res = {}
         if ig_enabled and ig_user_id:
             logger.info(f"[IG] Posting {media_type} to Instagram for {item['feed_id']}...")
-            ig_res = post_instagram(ig_user_id, ig_token, final_msg, media_path, is_video=is_video, is_sched=is_scheduled, sched_time=sched_time)
+            # NOTE: Instagram scheduled publishing requires special App Review approval
+            # that most apps don't have. Always post immediately to Instagram.
+            # Facebook scheduling works fine without additional approval.
+            ig_res = post_instagram(ig_user_id, ig_token, final_msg, media_path, is_video=is_video, is_sched=False, sched_time=None)
             ig_success = 'id' in ig_res
             
         # Check if it was skipped (e.g., video too long)
@@ -1056,19 +944,21 @@ async def main_async():
     with open('cucumber_report.json', 'w') as f:
         json.dump(cucumber_features, f, indent=2)
             
-    # Cleanup Temp Files (Now inside the function where temp_dir is defined)
+    # Cleanup Temp Files
     try:
-        if os.path.exists(temp_dir):
-            for file in os.listdir(temp_dir):
-                file_path = os.path.join(temp_dir, file)
+        cleanup_dir = tempfile.gettempdir()
+        for file in os.listdir(cleanup_dir):
+            # Only clean up our temp files (starting with temp_)
+            if file.startswith('temp_') or file.endswith('.mp4'):
+                file_path = os.path.join(cleanup_dir, file)
                 try:
                     if os.path.isfile(file_path):
                         os.unlink(file_path)
                 except Exception as e:
-                    logger.warning(f"Failed to delete {file_path}: {e}")
-            logger.info("Temp directory cleaned.")
+                    pass  # Silently ignore cleanup errors
+        logger.info("Temp files cleaned.")
     except Exception as e:
-        logger.warning(f"Error cleaning temp dir: {e}")
+        logger.warning(f"Error cleaning temp files: {e}")
 
     logger.info("Bot Run Completed. Reports generated: run_report.json, cucumber_report.json")
 

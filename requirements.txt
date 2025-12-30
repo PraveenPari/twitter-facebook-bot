@@ -2,4 +2,3 @@ requests
 yt-dlp
 playwright
 beautifulsoup4
-instagrapi
