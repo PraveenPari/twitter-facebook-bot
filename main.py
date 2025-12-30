@@ -681,8 +681,10 @@ async def main_async():
             return await scrape_nitter_user_tab(username, context)
         
         BATCH_SIZE = 3
-        results = []
+        results = {u: [] for u in usernames}  # Dict to track results per username
+        failed_accounts = []
         
+        # First pass - scrape all accounts in batches
         for batch_start in range(0, len(usernames), BATCH_SIZE):
             batch = usernames[batch_start:batch_start + BATCH_SIZE]
             logger.info(f"[BATCH] Scraping {len(batch)} accounts: {batch}")
@@ -691,18 +693,45 @@ async def main_async():
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
             for i, r in enumerate(batch_results):
+                username = batch[i]
                 if isinstance(r, Exception):
-                    logger.error(f"[ERROR] {batch[i]}: {r}")
-                    results.append([])
+                    logger.error(f"[ERROR] {username}: {r}")
+                    failed_accounts.append(username)
+                elif not r:  # Empty result (timeout/failed)
+                    logger.warning(f"[FAIL] {username}: No tweets returned")
+                    failed_accounts.append(username)
                 else:
-                    results.append(r)
+                    results[username] = r
+                    logger.info(f"[OK] {username}: Got {len(r)} tweets")
             
             # Wait between batches to avoid rate limit
             if batch_start + BATCH_SIZE < len(usernames):
                 logger.info("[BATCH] Waiting 2s before next batch...")
                 await asyncio.sleep(2)
         
-        success_count = sum(1 for r in results if r)
+        # Retry pass - retry failed accounts one at a time with longer wait
+        if failed_accounts:
+            logger.info(f"[RETRY] Retrying {len(failed_accounts)} failed accounts: {failed_accounts}")
+            await asyncio.sleep(3)  # Extra wait before retries
+            
+            for username in failed_accounts:
+                logger.info(f"[RETRY] Retrying {username}...")
+                try:
+                    retry_result = await scrape_in_tab(username, context)
+                    if retry_result:
+                        results[username] = retry_result
+                        logger.info(f"[RETRY OK] {username}: Got {len(retry_result)} tweets")
+                    else:
+                        logger.warning(f"[RETRY FAIL] {username}: Still no tweets")
+                except Exception as e:
+                    logger.error(f"[RETRY ERROR] {username}: {e}")
+                
+                await asyncio.sleep(2)  # Wait between retries
+        
+        # Convert dict back to list in original order
+        results_list = [results[u] for u in usernames]
+        
+        success_count = sum(1 for r in results_list if r)
         logger.info(f"[DONE] Loaded {success_count}/{len(usernames)} accounts successfully")
         
         await context.close()
@@ -710,7 +739,7 @@ async def main_async():
         
     # Process results
     posts_to_make = []
-    for i, tweets in enumerate(results):
+    for i, tweets in enumerate(results_list):
         # Use account 'id' for state key
         acc = accounts[i]
         feed_id = acc.get('id', acc.get('username', 'unknown'))
@@ -888,7 +917,7 @@ async def main_async():
     
     # Feature 1: Scrape Accounts
     elements = []
-    for i, res_list in enumerate(results):
+    for i, res_list in enumerate(results_list):
         acc = accounts[i]
         username = acc.get('username', 'unknown')
         status = "passed" if res_list else "failed" # Simple pass if we got tweets, fail if empty/error (optional logic)
