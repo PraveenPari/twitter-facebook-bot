@@ -1,5 +1,6 @@
 {
   "twitter_accounts": [
+    { "id": "Prakash Vijay", "username": "PrakazVijay_Of" },
     { "id": "tvk_vijay_main", "username": "TVKVijayHQ" },
     { "id": "tvk_party_hq", "username": "TVKPartyHQ" },
     { "id": "tvk_it_wing", "username": "TVKHQITWingOffl" },
@@ -11,7 +12,7 @@
     { "id": "jegadesh_tvk", "username": "JegadeshTVK" },
     { "id": "priyanka_smile", "username": "PriyankaSmile01" },
     { "id": "vijay_fans_trends", "username": "VijayFansTrends" },
-    { "id": "sangeet", "username": "sangeet29332013" },{ "id": "Prakash Vijay", "username": "PrakazVijay_Of" }
+    { "id": "sangeet", "username": "sangeet29332013" }
   ],
   "facebook": {
     "page_id": "USE_ENV_VAR",
