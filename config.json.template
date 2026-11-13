@@ -28,7 +28,7 @@
     "password": "YOUR_INSTAGRAM_PASSWORD"
   },
   "settings": {
-    "post_window_minutes": 10,
+    "post_window_minutes": 60,
     "schedule_gap_minutes": 10,
     "min_content_length": 5
   },
