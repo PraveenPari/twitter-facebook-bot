@@ -9,31 +9,26 @@ on:
 jobs:
   post-to-social:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-      
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests yt-dlp playwright beautifulsoup4
-          
-      - name: Install Playwright Browsers
-        run: |
-          playwright install chromium
-          playwright install-deps
-      
+          pip install -r requirements.txt
+
       - name: Download state from Gist
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
@@ -43,21 +38,72 @@ jobs:
           curl -s -H "Authorization: token $GIST_TOKEN" \
             "https://api.github.com/gists/$GIST_ID" | \
             python -c "import sys,json; d=json.load(sys.stdin); print(d.get('files',{}).get('state.json',{}).get('content','{}'))" > state.json
-      
+
       - name: Run bot
         env:
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          TWITTER_COOKIES: ${{ secrets.TWITTER_COOKIES }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: |
           # Create config from secret
-          echo "$CONFIG_JSON" > config.json
-          
-          # Run the bot with virtual display
-          xvfb-run --auto-servernum python main.py
+          printf '%s\n' "$CONFIG_JSON" > config.json
+
+          # Run the bot
+          python main.py
+
+      - name: Publish Run Summary
+        if: always()
+        run: |
+          python - << 'PY'
+          import json, os
+          from collections import Counter
+
+          if not os.path.exists("run_report.json"):
+              print("::warning title=Bot Run Summary::run_report.json was not generated")
+              raise SystemExit(0)
+
+          with open("run_report.json", "r", encoding="utf-8") as f:
+              report = json.load(f)
+
+          sources = report.get("fetch_sources") or {}
+          counts = Counter(sources.values())
+          suspended = report.get("suspended_accounts") or []
+          actions = report.get("facebook_actions") or []
+          ok_actions = sum(1 for a in actions if a.get("status") == "success")
+          fail_actions = sum(1 for a in actions if a.get("status") == "failed")
+          reachable = sum(1 for v in sources.values() if v not in ("none", "suspended", "invalid_username"))
+
+          src_summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+          notice = (
+              f"checked={report.get('accounts_checked', 0)}, "
+              f"reachable={reachable}, "
+              f"new_posts={report.get('new_posts_found', 0)}, "
+              f"actions_ok={ok_actions}, actions_failed={fail_actions}, "
+              f"sources=[{src_summary}]"
+          )
+          if suspended:
+              notice += f", suspended={suspended}"
+          print(f"::notice title=Bot Run Summary::{notice}")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as sf:
+                  sf.write("## Bot Run Summary\n\n")
+                  sf.write(f"- **Accounts checked:** {report.get('accounts_checked', 0)}\n")
+                  sf.write(f"- **Reachable:** {reachable}\n")
+                  sf.write(f"- **Lookback window:** {report.get('lookback_minutes', 60)} min\n")
+                  sf.write(f"- **New media posts found:** {report.get('new_posts_found', 0)}\n")
+                  sf.write(f"- **Publish actions:** {ok_actions} succeeded, {fail_actions} failed\n")
+                  if suspended:
+                      sf.write(f"- **Suspended accounts:** {', '.join(suspended)}\n")
+                  sf.write("\n### Fetch Sources\n\n| Account | Channel |\n|---|---|\n")
+                  for acc, src in sources.items():
+                      sf.write(f"| `{acc}` | `{src}` |\n")
+          PY
 
       - name: Upload Debug Artifacts
         if: always()
@@ -70,7 +116,7 @@ jobs:
             run_report.json
             cucumber_report.json
           retention-days: 7
-      
+
       - name: Upload state to Gist
         if: always()
         env:

@@ -1,4 +1,4 @@
 requests
 yt-dlp
-playwright
 beautifulsoup4
+twifork; python_version >= "3.10"

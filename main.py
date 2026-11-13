@@ -1,6 +1,7 @@
 """
-Twitter to Facebook Bot - PLAYWRIGHT NITTER VERSION
-Uses Playwright to scrape nitter directly + YouTube Live Monitor
+Twitter to Facebook & Instagram Bot
+Monitors X/Twitter accounts via multi-channel fetcher (FxTwitter API/RSS, optional cookies,
+X Guest GraphQL, X Syndication) + YouTube Live Monitor
 """
 import asyncio
 import json
@@ -15,8 +16,9 @@ from datetime import datetime, timedelta, timezone
 # 3rd party
 import requests
 import yt_dlp
-from playwright.async_api import async_playwright
 import logging
+
+from twitter_fetcher import TwitterFetcher, UserSuspendedError, parse_timestamp
 
 # Configure Logging
 # Force UTF-8 for stdout on Windows to support emojis
@@ -56,34 +58,121 @@ def load_config():
     raise Exception("No config found!")
 
 def load_state():
-    state = {'last_posted_ids': {}}
+    state = {
+        'last_posted_ids': {},
+        'posted_tweet_ids': {},
+        'global_posted_ids': [],
+        'user_ids': {},
+    }
     if os.path.exists('state.json'):
         try:
             with open('state.json', 'r', encoding='utf-8') as f:
                 loaded = json.load(f)
                 if isinstance(loaded, dict):
-                    # Merge loaded into default, or just ensure key exists
-                    if 'last_posted_ids' in loaded:
-                        return loaded
-                    else:
-                        loaded['last_posted_ids'] = {}
-                        return loaded
-        except:
+                    state.update(loaded)
+        except Exception:
             pass
+    if not isinstance(state.get('last_posted_ids'), dict):
+        state['last_posted_ids'] = {}
+    if not isinstance(state.get('posted_tweet_ids'), dict):
+        state['posted_tweet_ids'] = {}
+    if not isinstance(state.get('global_posted_ids'), list):
+        state['global_posted_ids'] = []
+    if not isinstance(state.get('user_ids'), dict):
+        state['user_ids'] = {}
     return state
+
 
 def save_state(state):
     with open('state.json', 'w', encoding='utf-8') as f:
         json.dump(state, f, indent=2)
 
+
+def is_already_posted(state, feed_id, tweet_id):
+    if state.get('last_posted_ids', {}).get(feed_id) == tweet_id:
+        return True
+    if tweet_id in state.get('posted_tweet_ids', {}).get(feed_id, []):
+        return True
+    if tweet_id in state.get('global_posted_ids', []):
+        return True
+    return False
+
+
+def record_posted_tweet(state, feed_id, tweet_id, max_per_feed=50, max_global=300):
+    state.setdefault('last_posted_ids', {})[feed_id] = tweet_id
+    posted_map = state.setdefault('posted_tweet_ids', {})
+    feed_hist = posted_map.setdefault(feed_id, [])
+    if tweet_id not in feed_hist:
+        feed_hist.append(tweet_id)
+    if len(feed_hist) > max_per_feed:
+        posted_map[feed_id] = feed_hist[-max_per_feed:]
+    global_hist = state.setdefault('global_posted_ids', [])
+    if tweet_id not in global_hist:
+        global_hist.append(tweet_id)
+    if len(global_hist) > max_global:
+        state['global_posted_ids'] = global_hist[-max_global:]
+
+
 def clean_text(text):
-    if not text: return ''
-    # Remove all URLs (including nitter URLs)
+    if not text:
+        return ''
+    # Remove all URLs (including t.co / x.com / nitter links)
     text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'nitter\.\S+', '', text)  # Remove any remaining nitter references
+    text = re.sub(r'(?:nitter|pic\.(?:twitter|x))\.\S+', '', text)
     text = re.sub(r'^(@\w+\s*)+', '', text)
     text = re.sub(r' +', ' ', text)
     return text.strip()
+
+
+def extract_username(acc):
+    username = (acc.get('username') or '').strip().lstrip('@')
+    if not username and 'url' in acc:
+        parts = [p for p in acc['url'].strip('/').split('/') if p]
+        if parts:
+            username = parts[-2] if parts[-1] == 'rss' and len(parts) >= 2 else parts[-1]
+    return username
+
+
+def resolve_lookback_minutes(config):
+    """Resolve lookback window in minutes, honoring env override while keeping a 60-min safety floor."""
+    env_val = os.environ.get('POST_WINDOW_MINUTES')
+    if env_val is not None:
+        try:
+            parsed = float(env_val)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            logger.warning(f"Invalid POST_WINDOW_MINUTES={env_val!r}; ignoring.")
+
+    settings = config.get('settings', {}) if isinstance(config, dict) else {}
+    configured = settings.get('post_window_minutes')
+    if configured is None:
+        configured = settings.get('lookback_minutes')
+
+    if configured is not None:
+        try:
+            parsed = float(configured)
+            if parsed > 0:
+                # Preserve 60-min default floor for legacy 10-min templates on 30-min cron
+                return max(parsed, 60.0)
+        except (TypeError, ValueError):
+            pass
+
+    return 60.0
+
+
+def is_tweet_within_window(tweet, max_age_seconds, now_ts=None):
+    """Check whether a tweet falls within the lookback window. Returns (within_window, age_str)."""
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    ts = tweet.get('created_timestamp')
+    if ts is None:
+        ts = parse_timestamp(tweet.get('date_str'), tweet.get('id'))
+    if ts is None:
+        return True, tweet.get('date_str') or 'unknown'
+    age_sec = max(0.0, float(now_ts) - float(ts))
+    age_td = timedelta(seconds=int(age_sec))
+    return age_sec <= max_age_seconds, str(age_td)
+
 
 # Fixed TVK Hashtags - 25 hashtags for all posts
 TVK_HASHTAGS = [
@@ -101,165 +190,83 @@ def generate_hashtags(content=None):
 
 # Caption enhancement removed - using original caption
 
-async def scrape_nitter_user_tab(username, context):
-    """Scrape nitter using a new tab in shared context (faster)"""
-    
-    instances = [
-        "https://nitter.net"
-    ]
-    
-    tweets = []
-    
-    logger.info(f"[{username}] Starting scrape...")
-    
-    # Create new tab (page) in shared context
-    page = await context.new_page()
-    
+
+def download_media(url, is_video=False, tweet_link=None):
+    """Download media directly via requests, falling back to yt-dlp for videos."""
+    temp_dir = tempfile.gettempdir()
+    unique_tag = f"{int(time.time() * 1000)}_{os.getpid()}_{random.randint(100, 999)}"
     try:
-        for instance in instances:
-            url = f"{instance}/{username}"
-            logger.info(f"[{username}] Trying {instance}...")
-            
-            try:
-                try:
-                    await page.goto(url, timeout=30000, wait_until='domcontentloaded') 
-                    title = await page.title()
-                    logger.info(f"[{username}] Loaded: {title}")
-                except:
-                    logger.error(f"[{username}] Timeout on {instance}")
-                    continue 
-
-                content = await page.content()
-                if "Rate limit" in content or "upstream connect error" in content:
-                    logger.error(f"[{username}] Blocked on {instance}")
-                    continue
-                
-                try:
-                    await page.wait_for_selector('.timeline-item', timeout=15000)
-                except:
-                    logger.error(f"[{username}] Timeline failed on {instance}")
-                    continue
-                
-                logger.info(f"[{username}] [OK] Loaded")
-                
-                items = await page.query_selector_all('.timeline-item')
-                logger.info(f"[{username}] Found {len(items)} items")
-                
-                for item in items[:5]:
-                    text_el = await item.query_selector('.tweet-content')
-                    text = await text_el.inner_text() if text_el else ""
-                    
-                    link_el = await item.query_selector('.tweet-link')
-                    href = await link_el.get_attribute('href') if link_el else ""
-                    tweet_id = href.split('/')[-1].split('#')[0] if href else ""
-                    full_link = f"{instance}{href}" if href else ""
-                    
-                    media_url = None
-                    has_video = False
-                    
-                    # Check for video first (multiple methods)
-                    vid_el = await item.query_selector('.attachments video')
-                    gallery_vid = await item.query_selector('.gallery-video')
-                    if vid_el or gallery_vid: 
-                        has_video = True
-                    
-                    # Get image/thumbnail
-                    img_el = await item.query_selector('.attachments img')
-                    if img_el:
-                        src = await img_el.get_attribute('src')
-                        if src: 
-                            media_url = f"{instance}{src}"
-                            # If URL contains video_thumb, it's actually a video
-                            if 'video_thumb' in src or 'ext_tw_video' in src:
-                                has_video = True
-                    
-                    # Extract Timestamp
-                    date_str = ""
-                    date_el = await item.query_selector('.tweet-date a')
-                    if date_el:
-                        date_str = await date_el.get_attribute('title')
-                    
-                    # Check Pinned
-                    is_pinned = False
-                    pin_el = await item.query_selector('.pinned')
-                    if pin_el: is_pinned = True
-
-                    if tweet_id:
-                        tweets.append({
-                            'id': tweet_id,
-                            'text': text,
-                            'link': full_link,
-                            'media_url': media_url,
-                            'has_video': has_video,
-                            'date_str': date_str,
-                            'is_pinned': is_pinned
-                        })
-                
-                break  # Success, exit instance loop
-                
-            except Exception as e:
-                logger.error(f"[{username}] Error: {e}")
-                continue 
-                
-    finally:
-        await page.close()
-
-    return tweets
-
-def download_media(url, is_video=False):
-    """Download media using requests or yt-dlp"""
-    try:
-        temp_dir = tempfile.gettempdir()
         if is_video:
-            # For video, use yt-dlp on the tweet URL (replace nitter with twitter for better extraction)
-            # URL might be nitter.poast.org, so generalized replacement
-            if 'nitter' in url:
-                # regex to replace base url with twitter.com
-                tweet_url = re.sub(r'https://nitter\.[^/]+', 'https://twitter.com', url)
-            else:
-                tweet_url = url
-                
-            logger.info(f"Downloading video from {tweet_url}...")
-            # Force compatible format (mp4/h264) for Instagram/Facebook
-            out_tmpl = os.path.join(temp_dir, '%(id)s.%(ext)s')
-            # 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' l
-            
-            # This prioritizes mp4 containers which are safest for Graph API
-            ydl_opts = {
-                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', 
-                'outtmpl': out_tmpl, 
-                'quiet':True,
-                'merge_output_format': 'mp4' # Force merge to mp4 if needed
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(tweet_url, download=True)
-                # ... (rest of function same) ...
-                if info:
-                     # Get actual filename
-                    path = ydl.prepare_filename(info)
-                    
-                    # Sanity check: does it exist?
-                    if not os.path.exists(path):
-                         # Try finding it by ID if prepare_filename is slightly off (e.g. mkv vs mp4)
-                        vid_id = info['id']
-                        potential_files = [f for f in os.listdir(temp_dir) if vid_id in f]
-                        if potential_files:
-                            path = os.path.join(temp_dir, potential_files[0])
+            # 1. Fast path: direct MP4 URL from FxTwitter / GraphQL / twikit
+            if url and ('.mp4' in url.split('?')[0] or 'video.twimg.com' in url):
+                logger.info(f"Downloading direct MP4 video from {url}...")
+                try:
+                    with requests.get(
+                        url,
+                        stream=True,
+                        timeout=120,
+                        headers={'User-Agent': 'Mozilla/5.0'},
+                    ) as r:
+                        if r.status_code == 200:
+                            path = os.path.join(temp_dir, f"temp_vid_{unique_tag}.mp4")
+                            with open(path, 'wb') as f:
+                                for chunk in r.iter_content(chunk_size=65536):
+                                    if chunk:
+                                        f.write(chunk)
+                            if os.path.exists(path) and os.path.getsize(path) > 1024:
+                                logger.info(f"Video downloaded directly: {path}")
+                                return path
+                            if os.path.exists(path):
+                                os.unlink(path)
                         else:
-                            logger.error(f"Downloaded file not found for ID {vid_id}")
-                            return None
+                            logger.warning(f"Direct MP4 download returned HTTP {r.status_code}; trying yt-dlp fallback")
+                except Exception as e:
+                    logger.warning(f"Direct MP4 download failed ({e}); trying yt-dlp fallback")
 
-                    logger.info(f"Video downloaded: {path}")
-                    return path
+            # 2. Fallback: yt-dlp against canonical tweet URL
+            target_url = tweet_link or url
+            if target_url:
+                if 'nitter' in target_url:
+                    target_url = re.sub(r'https?://nitter\.[^/]+', 'https://x.com', target_url)
+                logger.info(f"Downloading video via yt-dlp from {target_url}...")
+                out_tmpl = os.path.join(temp_dir, 'temp_ytdlp_%(id)s.%(ext)s')
+                ydl_opts = {
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'outtmpl': out_tmpl,
+                    'quiet': True,
+                    'merge_output_format': 'mp4',
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(target_url, download=True)
+                    if info:
+                        path = ydl.prepare_filename(info)
+                        if not os.path.exists(path):
+                            vid_id = str(info.get('id') or '')
+                            potential_files = [
+                                f for f in os.listdir(temp_dir)
+                                if vid_id and vid_id in f
+                            ]
+                            if potential_files:
+                                path = os.path.join(temp_dir, potential_files[0])
+                            else:
+                                logger.error(f"Downloaded file not found for ID {vid_id}")
+                                return None
+                        logger.info(f"Video downloaded via yt-dlp: {path}")
+                        return path
         else:
-            # Image
+            if not url:
+                return None
             logger.info(f"Downloading image from {url}...")
-            r = requests.get(url, timeout=30)
-            if r.status_code==200:
-                path = os.path.join(temp_dir, f"temp_img_{int(time.time())}.jpg")
-                with open(path, 'wb') as f: f.write(r.content)
+            r = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code == 200 and r.content:
+                ctype = (r.headers.get('Content-Type') or '').lower()
+                ext = '.png' if 'png' in ctype else '.jpg'
+                path = os.path.join(temp_dir, f"temp_img_{unique_tag}{ext}")
+                with open(path, 'wb') as f:
+                    f.write(r.content)
                 logger.info(f"Image downloaded: {path}")
                 return path
+            logger.warning(f"Image download returned HTTP {r.status_code} for {url}")
     except Exception as e:
         logger.error(f"Media download fail: {e}")
     return None
@@ -626,271 +633,277 @@ def post_instagram(ig_user_id, token, msg, media_path=None, is_video=False, is_s
         return {'error': str(e)}
 
 async def main_async():
-    logger.info("="*60)
-    logger.info("Bot Started: Playwright (Failover Nitter) + YouTube Live")
-    logger.info("="*60)
-    
-    temp_dir = tempfile.gettempdir()
-    
+    logger.info("=" * 60)
+    logger.info("Bot Started: Multi-Channel X/Twitter Fetcher + YouTube Live")
+    logger.info("=" * 60)
+
     config = load_config()
     state = load_state()
-    
+
     # 1. Check YouTube Live
     if HAS_YOUTUBE and config.get('youtube_restream', {}).get('enabled'):
         logger.info("Checking YouTube Live...")
         if youtube_live_monitor.check_and_restream(config):
             logger.info("Re-streaming started. Stopping Twitter check.")
-            return # Stop if re-streaming
+            return  # Stop if re-streaming
 
-    # 2. Check Twitter (Nitter)
-    logger.info("Starting Playwright Browser...")
-    async with async_playwright() as p:
-        # Launch in headless mode for deployment
-        browser = await p.chromium.launch(
-            headless=False,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-setuid-sandbox'
-            ]
-        )
-        
-        # Create ONE shared context for all tabs
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={'width': 1920, 'height': 1080},
-            locale='en-US'
-        )
-        
-        accounts = config.get('feeds', []) or config.get('twitter_accounts', [])
-        logger.info(f"Loaded {len(accounts)} accounts to check.")
+    # 2. Fetch X/Twitter timelines (FxTwitter API/RSS -> optional twikit -> X Guest GraphQL -> Syndication)
+    settings = config.get('settings', {}) if isinstance(config, dict) else {}
+    lookback_minutes = resolve_lookback_minutes(config)
+    max_age_seconds = lookback_minutes * 60.0
+    schedule_gap_minutes = max(1, int(settings.get('schedule_gap_minutes', 10) or 10))
+    include_retweets = settings.get('include_retweets', True)
+    twitter_cfg = config.get('twitter', {}) if isinstance(config, dict) else {}
 
-        # Prepare usernames
-        usernames = []
-        for acc in accounts:
-            username = acc.get('username')
-            if not username and 'url' in acc:
-                username = acc['url'].strip('/').split('/')[-1]
-                if username == 'rss': username = acc['url'].strip('/').split('/')[-2]
-            usernames.append(username)
-        
-        # Scrape in BATCHES of 3 to avoid rate limiting
-        async def scrape_in_tab(username, context):
-            if not username:
-                return []
-            return await scrape_nitter_user_tab(username, context)
-        
-        BATCH_SIZE = 3
-        results = {u: [] for u in usernames}  # Dict to track results per username
-        failed_accounts = []
-        
-        # First pass - scrape all accounts in batches
-        for batch_start in range(0, len(usernames), BATCH_SIZE):
-            batch = usernames[batch_start:batch_start + BATCH_SIZE]
-            logger.info(f"[BATCH] Scraping {len(batch)} accounts: {batch}")
-            
-            tasks = [scrape_in_tab(u, context) for u in batch]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for i, r in enumerate(batch_results):
-                username = batch[i]
-                if isinstance(r, Exception):
-                    logger.error(f"[ERROR] {username}: {r}")
-                    failed_accounts.append(username)
-                elif not r:  # Empty result (timeout/failed)
-                    logger.warning(f"[FAIL] {username}: No tweets returned")
-                    failed_accounts.append(username)
+    fetcher = TwitterFetcher(
+        user_id_cache=state['user_ids'],
+        cookies=twitter_cfg.get('cookies'),
+        include_retweets=include_retweets,
+    )
+
+    accounts = config.get('feeds', []) or config.get('twitter_accounts', [])
+    logger.info(f"Loaded {len(accounts)} accounts to check (lookback: {lookback_minutes:.0f} min).")
+
+    usernames = [extract_username(acc) for acc in accounts]
+    results_list = [[] for _ in accounts]
+    fetch_sources = ['none' for _ in accounts]
+    failed_indices = []
+
+    BATCH_SIZE = 3
+
+    async def fetch_one(username):
+        if not username:
+            return [], 'invalid_username'
+        return await fetcher.afetch_user_tweets(username, limit=20)
+
+    # First pass - fetch accounts in batches of 3
+    for batch_start in range(0, len(usernames), BATCH_SIZE):
+        batch_indices = list(range(batch_start, min(batch_start + BATCH_SIZE, len(usernames))))
+        batch_names = [usernames[idx] for idx in batch_indices]
+        logger.info(f"[BATCH] Fetching {len(batch_names)} accounts: {batch_names}")
+
+        tasks = [fetch_one(usernames[idx]) for idx in batch_indices]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for idx, res in zip(batch_indices, batch_results):
+            username = usernames[idx]
+            if isinstance(res, Exception):
+                logger.error(f"[ERROR] {username}: {res}")
+                failed_indices.append(idx)
+                fetch_sources[idx] = 'none'
+            else:
+                tweets, source = res
+                results_list[idx] = tweets
+                fetch_sources[idx] = source
+                if source == 'suspended':
+                    logger.warning(f"[SUSPENDED] {username}: Account is suspended on X (skipping)")
+                elif source == 'none':
+                    logger.warning(f"[FAIL] {username}: All fetch channels returned nothing")
+                    failed_indices.append(idx)
+                elif not tweets:
+                    logger.info(f"[OK] {username} ({source}): 0 tweets")
                 else:
-                    results[username] = r
-                    logger.info(f"[OK] {username}: Got {len(r)} tweets")
-            
-            # Wait between batches to avoid rate limit
-            if batch_start + BATCH_SIZE < len(usernames):
-                logger.info("[BATCH] Waiting 2s before next batch...")
-                await asyncio.sleep(2)
-        
-        # Retry pass - retry failed accounts one at a time with longer wait
-        if failed_accounts:
-            logger.info(f"[RETRY] Retrying {len(failed_accounts)} failed accounts: {failed_accounts}")
-            await asyncio.sleep(3)  # Extra wait before retries
-            
-            for username in failed_accounts:
-                logger.info(f"[RETRY] Retrying {username}...")
-                try:
-                    retry_result = await scrape_in_tab(username, context)
-                    if retry_result:
-                        results[username] = retry_result
-                        logger.info(f"[RETRY OK] {username}: Got {len(retry_result)} tweets")
-                    else:
-                        logger.warning(f"[RETRY FAIL] {username}: Still no tweets")
-                except Exception as e:
-                    logger.error(f"[RETRY ERROR] {username}: {e}")
-                
-                await asyncio.sleep(2)  # Wait between retries
-        
-        # Convert dict back to list in original order
-        results_list = [results[u] for u in usernames]
-        
-        success_count = sum(1 for r in results_list if r)
-        logger.info(f"[DONE] Loaded {success_count}/{len(usernames)} accounts successfully")
-        
-        await context.close()
-        await browser.close()
-        
+                    logger.info(f"[OK] {username} ({source}): Got {len(tweets)} tweets")
+
+        if batch_start + BATCH_SIZE < len(usernames):
+            await asyncio.sleep(1.5)
+
+    # Retry pass for transient failures only (skip suspended/empty/invalid)
+    if failed_indices:
+        retry_names = [usernames[idx] for idx in failed_indices]
+        logger.info(f"[RETRY] Retrying {len(failed_indices)} failed accounts: {retry_names}")
+        await asyncio.sleep(3)
+
+        for idx in failed_indices:
+            username = usernames[idx]
+            logger.info(f"[RETRY] Retrying {username}...")
+            try:
+                tweets, source = await fetch_one(username)
+                results_list[idx] = tweets
+                fetch_sources[idx] = source
+                if tweets:
+                    logger.info(f"[RETRY OK] {username} ({source}): Got {len(tweets)} tweets")
+                elif source == 'suspended':
+                    logger.warning(f"[RETRY SUSPENDED] {username}: Account is suspended on X")
+                else:
+                    logger.warning(f"[RETRY FAIL] {username} ({source}): Still no tweets")
+            except Exception as e:
+                logger.error(f"[RETRY ERROR] {username}: {e}")
+            await asyncio.sleep(1.5)
+
+    success_count = sum(1 for src in fetch_sources if src not in ('none', 'suspended', 'invalid_username'))
+    logger.info(f"[DONE] Checked {success_count}/{len(accounts)} reachable accounts successfully")
+
+    # Persist newly cached user_ids right away
+    save_state(state)
+
     # Process results
+    now_ts = time.time()
     posts_to_make = []
     for i, tweets in enumerate(results_list):
-        # Use account 'id' for state key
         acc = accounts[i]
-        feed_id = acc.get('id', acc.get('username', 'unknown'))
-        
-        if not tweets:
-            logger.warning(f"[{feed_id}] No tweets fetched (scrape failed or empty)")
+        feed_id = acc.get('id') or extract_username(acc) or 'unknown'
+        source = fetch_sources[i]
+
+        if source == 'suspended':
             continue
-        
-        # Find posts within 1 hour and log them
-        posts_within_hour = []
+
+        if not tweets:
+            if source == 'none':
+                logger.warning(f"[{feed_id}] No tweets fetched (all channels failed)")
+            else:
+                logger.info(f"[{feed_id}] No tweets returned ({source})")
+            continue
+
+        posts_within_window = []
         for tweet in tweets:
-            tweet_id = tweet['id']
-            
-            # Skip pinned
+            tweet_id = str(tweet.get('id') or '').strip()
+            if not tweet_id:
+                continue
+
             if tweet.get('is_pinned'):
                 continue
-            
-            # Skip already posted
-            if state.get('last_posted_ids', {}).get(feed_id) == tweet_id:
+
+            if is_already_posted(state, feed_id, tweet_id):
                 continue
-            
-            # Skip no media
+
             if not tweet.get('has_video') and not tweet.get('media_url'):
                 continue
-                
-            # Check Time (1 hour = 3600 seconds)
-            is_old = False
-            age_str = "unknown"
-            if 'date_str' in tweet and tweet['date_str']:
-                try:
-                    d_str = tweet['date_str'].replace('UTC', '').strip()
-                    post_time = datetime.strptime(d_str, "%b %d, %Y · %I:%M %p")
-                    post_time = post_time.replace(tzinfo=timezone.utc)
-                    now = datetime.now(timezone.utc)
-                    age = now - post_time
-                    age_str = str(age).split('.')[0]  # Remove microseconds
-                    
-                    if age.total_seconds() > 3600:  # 1 hour
-                        is_old = True
-                except:
-                    age_str = tweet['date_str']  # Use raw date if parsing fails
-            
-            if not is_old:
+
+            within_window, age_str = is_tweet_within_window(tweet, max_age_seconds, now_ts=now_ts)
+            if within_window:
                 media_type = "VIDEO" if tweet.get('has_video') else "IMAGE"
-                posts_within_hour.append({
+                posts_within_window.append({
                     'id': tweet_id,
                     'type': media_type,
-                    'age': age_str
+                    'age': age_str,
                 })
-        
-        # Log posts within 1 hour for this account
-        if posts_within_hour:
-            for p in posts_within_hour:
-                logger.info(f"[FOUND] [{feed_id}] {p['type']} {p['id']} (Age: {p['age']})")
-            
-            # Take the first one (newest)
-            best = posts_within_hour[0]
-            best_tweet = next(t for t in tweets if t['id'] == best['id'])
-            
+
+        if posts_within_window:
+            for p in posts_within_window:
+                logger.info(f"[FOUND] [{feed_id}] {p['type']} {p['id']} (Age: {p['age']}, via {source})")
+
+            best = posts_within_window[0]
+            best_tweet = next(t for t in tweets if str(t.get('id')) == best['id'])
             posts_to_make.append({
                 'feed_id': feed_id,
-                'tweet': best_tweet
+                'tweet': best_tweet,
             })
-            
+
+    # Deduplicate same tweet ID across multiple accounts (e.g. retweets), preferring non-retweet
+    deduped_posts = {}
+    for item in posts_to_make:
+        tid = str(item['tweet']['id'])
+        existing = deduped_posts.get(tid)
+        if existing is None or (existing['tweet'].get('is_retweet') and not item['tweet'].get('is_retweet')):
+            deduped_posts[tid] = item
+    posts_to_make = list(deduped_posts.values())
+
     logger.info(f"Found {len(posts_to_make)} new posts with media.")
-    
+
     # Separate videos (priority) and images
     video_posts = [p for p in posts_to_make if p['tweet'].get('has_video')]
     image_posts = [p for p in posts_to_make if not p['tweet'].get('has_video')]
-    
-    # Combine: Videos first (priority), then images
     all_posts = video_posts + image_posts
-    
+
     logger.info(f"[QUEUE] {len(video_posts)} videos + {len(image_posts)} images = {len(all_posts)} total")
-    
+
     # 3. Post to Facebook & Instagram
-    page_id = os.environ.get('FB_PAGE_ID') or config['facebook']['page_id']
-    token = os.environ.get('FB_ACCESS_TOKEN') or config['facebook']['access_token']
-    
-    # Instagram config
-    ig_enabled = config.get('instagram', {}).get('enabled', False)
-    ig_user_id = os.environ.get('IG_USER_ID') or config.get('instagram', {}).get('user_id')
-    ig_token = os.environ.get('IG_ACCESS_TOKEN') or config.get('instagram', {}).get('access_token')
-    
-    base_time = int(time.time())
-    
+    fb_cfg = config.get('facebook', {}) if isinstance(config, dict) else {}
+    page_id = os.environ.get('FB_PAGE_ID') or fb_cfg.get('page_id')
+    token = os.environ.get('FB_ACCESS_TOKEN') or fb_cfg.get('access_token')
+
+    ig_cfg = config.get('instagram', {}) if isinstance(config, dict) else {}
+    ig_enabled = ig_cfg.get('enabled', False)
+    ig_user_id = os.environ.get('IG_USER_ID') or ig_cfg.get('user_id')
+    ig_token = os.environ.get('IG_ACCESS_TOKEN') or ig_cfg.get('access_token')
+
     post_stats = []
-    
-    for i, item in enumerate(all_posts):
+    downloaded_files = []
+    ready_post_count = 0
+
+    for item in all_posts:
         tweet = item['tweet']
         is_video = tweet.get('has_video', False)
         media_type = "VIDEO" if is_video else "IMAGE"
-        
-        # First post = immediate, rest = scheduled at +11 min from now
-        # Facebook requires scheduled time to be at least 10 min in the future
-        if i == 0:
+
+        # Download media
+        if is_video:
+            media_path = download_media(tweet.get('video_url'), is_video=True, tweet_link=tweet.get('link'))
+        else:
+            media_path = download_media(tweet.get('media_url'), is_video=False)
+
+        if not media_path:
+            logger.error(f"Failed to download {media_type} for {item['feed_id']}")
+            post_stats.append({
+                'id': item['feed_id'],
+                'type': media_type.lower(),
+                'status': 'failed',
+                'error': 'download_failed',
+            })
+            continue
+
+        downloaded_files.append(media_path)
+
+        # First deliverable post = immediate, subsequent posts = spaced by schedule_gap_minutes (min +20m)
+        if ready_post_count == 0:
             is_scheduled = False
             sched_time = None
             logger.info(f"[NOW] Posting {media_type} for {item['feed_id']}...")
         else:
             is_scheduled = True
-            # Each scheduled post is +20 min from current time (safe for IG/FB)
             current_time = int(time.time())
-            sched_time = current_time + 1200  # +20 min from NOW
-            logger.info(f"[SCHEDULE +20min] {media_type} for {item['feed_id']}...")
-        
-        # Download media
-        if is_video:
-            media_path = download_media(tweet['link'], is_video=True)
-        else:
-            media_path = download_media(tweet['media_url'], is_video=False)
-            
-        if not media_path:
-            logger.error(f"Failed to download {media_type} for {item['feed_id']}")
-            post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'status': 'failed', 'error': 'download_failed'})
-            continue
-        
+            offset_seconds = 1200 + (ready_post_count - 1) * schedule_gap_minutes * 60
+            sched_time = current_time + offset_seconds
+            logger.info(f"[SCHEDULE +{offset_seconds // 60}min] {media_type} for {item['feed_id']}...")
+        ready_post_count += 1
+
         # Build caption with hashtags
-        msg = clean_text(tweet['text'])
+        msg = clean_text(tweet.get('text', ''))
         tags = generate_hashtags(msg)
-        final_msg = f"{msg}\n\n{' '.join(tags)}"
-        
+        final_msg = f"{msg}\n\n{' '.join(tags)}" if msg else ' '.join(tags)
+
         # Post to Facebook
         res = post_facebook(page_id, token, final_msg, media_path, is_video=is_video, is_sched=is_scheduled, sched_time=sched_time)
         fb_success = 'id' in res or 'post_id' in res
-        post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'facebook', 'status': 'success' if fb_success else 'failed', 'error': res.get('error')})
-        
-        # Prioritize Catbox for images
-        # Post to Instagram 
+        post_stats.append({
+            'id': item['feed_id'],
+            'type': media_type.lower(),
+            'platform': 'facebook',
+            'status': 'success' if fb_success else 'failed',
+            'error': res.get('error'),
+        })
+
+        # Post to Instagram
         ig_success = False
         ig_res = {}
         if ig_enabled and ig_user_id:
             logger.info(f"[IG] Posting {media_type} to Instagram for {item['feed_id']}...")
-            # NOTE: Instagram scheduled publishing requires special App Review approval
-            # that most apps don't have. Always post immediately to Instagram.
-            # Facebook scheduling works fine without additional approval.
             ig_res = post_instagram(ig_user_id, ig_token, final_msg, media_path, is_video=is_video, is_sched=False, sched_time=None)
             ig_success = 'id' in ig_res
-            
-        # Check if it was skipped (e.g., video too long)
+
         if ig_res.get('skipped'):
             logger.info(f"[IG SKIP] {item['feed_id']}: {ig_res.get('error')}")
         elif ig_success:
             logger.info(f"[IG OK] {media_type} posted to Instagram for {item['feed_id']}")
-            post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'instagram', 'status': 'success'})
-        elif ig_enabled and ig_user_id: # Only log error if we actually tried
+            post_stats.append({
+                'id': item['feed_id'],
+                'type': media_type.lower(),
+                'platform': 'instagram',
+                'status': 'success',
+            })
+        elif ig_enabled and ig_user_id:
             logger.error(f"[IG FAIL] {item['feed_id']}: {ig_res.get('error')}")
-            post_stats.append({'id': item['feed_id'], 'type': media_type.lower(), 'platform': 'instagram', 'status': 'failed', 'error': ig_res.get('error')})
-        
+            post_stats.append({
+                'id': item['feed_id'],
+                'type': media_type.lower(),
+                'platform': 'instagram',
+                'status': 'failed',
+                'error': ig_res.get('error'),
+            })
+
         if fb_success or ig_success:
-            state['last_posted_ids'][item['feed_id']] = tweet['id']
+            record_posted_tweet(state, item['feed_id'], str(tweet['id']))
             save_state(state)
             if is_scheduled:
                 ig_status_str = "posted" if ig_success else "failed/skipped"
@@ -898,56 +911,60 @@ async def main_async():
             else:
                 ig_status_str = "IG:OK" if ig_success else "IG:FAIL/SKIP"
                 logger.info(f"[OK] {media_type} posted (FB:OK {ig_status_str}) for {item['feed_id']}")
-            
+
     # Save Reports
     run_timestamp = datetime.now().isoformat()
-    
-    # 1. Internal JSON Report
+
     report = {
         'timestamp': run_timestamp,
         'accounts_checked': len(accounts),
+        'lookback_minutes': lookback_minutes,
         'new_posts_found': len(posts_to_make),
-        'facebook_actions': post_stats
+        'fetch_sources': {
+            (usernames[idx] or accounts[idx].get('id', f'account_{idx}')): fetch_sources[idx]
+            for idx in range(len(accounts))
+        },
+        'suspended_accounts': [
+            usernames[idx]
+            for idx in range(len(accounts))
+            if fetch_sources[idx] == 'suspended'
+        ],
+        'facebook_actions': post_stats,
     }
-    with open('run_report.json', 'w') as f:
+    with open('run_report.json', 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=2)
-        
-    # 2. Cucumber JSON Report (for Artifacts/Allure)
+
     cucumber_features = []
-    
-    # Feature 1: Scrape Accounts
+
     elements = []
-    for i, res_list in enumerate(results_list):
-        acc = accounts[i]
-        username = acc.get('username', 'unknown')
-        status = "passed" if res_list else "failed" # Simple pass if we got tweets, fail if empty/error (optional logic)
-        if not res_list: status = "skipped" # If just no new tweets, technically not a fail, but for report usage:
-        
-        # Check if we had an error log for this user? (Hard to track without better state, assuming pass if no exception flow)
-        # We'll treat finding items as pass.
-        
-        step_status = "passed"
-        if not res_list: step_status = "passed" # It's okay to find 0 items
-        
+    for idx, acc in enumerate(accounts):
+        username = usernames[idx] or acc.get('id', 'unknown')
+        src = fetch_sources[idx]
+        if src == 'suspended':
+            step_status = 'skipped'
+        elif src in ('none', 'invalid_username'):
+            step_status = 'failed'
+        else:
+            step_status = 'passed'
+
         elements.append({
             "name": f"Check Account: {username}",
             "type": "scenario",
             "steps": [
                 {
-                    "name": f"Scrape {username}",
-                    "result": {"status": step_status, "duration": 1000000}
+                    "name": f"Fetch {username} ({src})",
+                    "result": {"status": step_status, "duration": 1000000},
                 }
-            ]
+            ],
         })
-    
+
     cucumber_features.append({
-        "name": "Twitter Scraping",
-        "description": "Scrape tweets from Nitter instances",
+        "name": "Twitter Timeline Fetch",
+        "description": "Fetch tweets via multi-channel X/Twitter fetcher",
         "uri": "main.py",
-        "elements": elements
+        "elements": elements,
     })
-    
-    # Feature 2: Facebook Posting
+
     fb_elements = []
     for action in post_stats:
         status = "passed" if action['status'] == 'success' else "failed"
@@ -957,39 +974,48 @@ async def main_async():
             "steps": [
                 {
                     "name": "Upload and Post",
-                    "result": {"status": status, "error_message": action.get('error', '')}
+                    "result": {"status": status, "error_message": action.get('error', '')},
                 }
-            ]
+            ],
         })
-    
+
     if fb_elements:
         cucumber_features.append({
             "name": "Facebook Publishing",
             "description": "Upload content to Facebook Page",
             "uri": "main.py",
-            "elements": fb_elements
+            "elements": fb_elements,
         })
-        
-    with open('cucumber_report.json', 'w') as f:
+
+    with open('cucumber_report.json', 'w', encoding='utf-8') as f:
         json.dump(cucumber_features, f, indent=2)
-            
+
     # Cleanup Temp Files
     try:
+        for file_path in downloaded_files:
+            try:
+                if file_path and os.path.isfile(file_path):
+                    os.unlink(file_path)
+            except Exception:
+                pass
         cleanup_dir = tempfile.gettempdir()
         for file in os.listdir(cleanup_dir):
-            # Only clean up our temp files (starting with temp_)
             if file.startswith('temp_') or file.endswith('.mp4'):
                 file_path = os.path.join(cleanup_dir, file)
                 try:
                     if os.path.isfile(file_path):
                         os.unlink(file_path)
-                except Exception as e:
-                    pass  # Silently ignore cleanup errors
+                except Exception:
+                    pass
         logger.info("Temp files cleaned.")
     except Exception as e:
         logger.warning(f"Error cleaning temp files: {e}")
 
     logger.info("Bot Run Completed. Reports generated: run_report.json, cucumber_report.json")
+
+    if accounts and success_count == 0 and any(src != 'suspended' for src in fetch_sources):
+        logger.error("All reachable X/Twitter accounts failed to fetch across all channels.")
+        raise SystemExit(1)
 
 if __name__ == '__main__':
     asyncio.run(main_async())

@@ -1,30 +1,31 @@
 # Twitter to Facebook & Instagram Bot
 
-Automated bot that monitors Twitter (via Nitter) and cross-posts content to Facebook Pages and Instagram Business Accounts.
+Automated bot that monitors public X/Twitter accounts (without Nitter or paid X API keys) and cross-posts media tweets to Facebook Pages and Instagram Business Accounts.
 
 ## Features
 
-- 🐦 Monitors multiple Twitter accounts via Nitter
-- 📘 Posts to Facebook Pages (text, images, videos)
-- 📸 Posts to Instagram Business Account (images, reels)
-- 🎬 Video duration check (skips Instagram for videos > 5 minutes)
-- ⏰ Scheduled posting with 10-minute intervals
-- 🔄 State persistence (avoids duplicate posts)
+- 🐦 Multi-channel X/Twitter monitoring (no Nitter or browser automation required):
+  1. **FxTwitter v2 API** (`api.fxtwitter.com` profile statuses + search fallback, caching numeric user IDs in `state.json`)
+  2. **FxTwitter RSS Feed** (`fxtwitter.com/{handle}/feed.xml`)
+  3. **Optional X Cookies (`twifork`/`twikit`)** via `TWITTER_COOKIES` env var or `twitter_cookies.json`
+  4. **Direct X Guest GraphQL** (`api.x.com` guest token + GraphQL timeline)
+  5. **X Syndication Embed API** fallback
+- 📘 Posts to Facebook Pages (images and videos, with native scheduling)
+- 📸 Posts to Instagram Business Account (images and Reels up to 15 minutes via direct resumable upload)
+- ⏰ Scheduled Facebook posting spaced by `schedule_gap_minutes`
+- 🔄 State persistence (`state.json`) to avoid duplicate posts and cache numeric X user IDs
 - 🎥 YouTube Live re-streaming support (optional)
-- ✨ AI-powered caption enhancement via Gemini (optional)
 
 ## Requirements
 
-- Python 3.9+
-- FFmpeg/FFprobe (for video duration check)
-- Playwright browsers
+- Python 3.10+ (Python 3.9 works without optional `twifork` cookie fallback)
+- FFmpeg/FFprobe (for video duration checks and `yt-dlp` fallback merging)
 
 ## Setup
 
 1. **Install dependencies:**
    ```bash
    pip install -r requirements.txt
-   playwright install chromium
    ```
 
 2. **Install FFmpeg (for video duration check):**
@@ -34,8 +35,8 @@ Automated bot that monitors Twitter (via Nitter) and cross-posts content to Face
 
 3. **Configure the bot:**
    - Copy `config.json.template` to `config.json`
-   - Add your Facebook Page Access Token
-   - Add your Instagram Business Account ID
+   - Add your Facebook Page ID and Access Token (or set `FB_PAGE_ID` / `FB_ACCESS_TOKEN`)
+   - Add your Instagram Business Account ID and Access Token (or set `IG_USER_ID` / `IG_ACCESS_TOKEN`)
    - Configure Twitter accounts to monitor
 
 ## Configuration
@@ -55,11 +56,16 @@ Automated bot that monitors Twitter (via Nitter) and cross-posts content to Face
     "access_token": "YOUR_USER_ACCESS_TOKEN"
   },
   "settings": {
-    "post_window_minutes": 30,
+    "post_window_minutes": 60,
     "schedule_gap_minutes": 10
   }
 }
 ```
+
+### Optional X/Twitter Cookies Fallback
+No X API key or login is needed for normal operation (FxTwitter v2 works out of the box). If you ever want a cookie-authenticated backup channel via `twifork`, export cookies (`auth_token`, `ct0`, etc.) from a logged-in browser session and supply them either:
+- as `TWITTER_COOKIES` environment variable / GitHub Secret (JSON object, cookie-editor JSON array, or `key=value; ...` string), or
+- in a local `twitter_cookies.json` file (already gitignored).
 
 ## Token Setup
 
@@ -81,26 +87,28 @@ Automated bot that monitors Twitter (via Nitter) and cross-posts content to Face
 python main.py
 ```
 
+Set `POST_WINDOW_MINUTES` to override the tweet lookback window in minutes (default: `60`).
+
 ## GitHub Actions Deployment
 
-The bot can run on a schedule via GitHub Actions. See `.github/workflows/` for the workflow configuration.
+The bot runs on a 30-minute schedule via `.github/workflows/bot.yml` (no Playwright/Chromium or `xvfb-run` needed).
 
-### Required Secrets:
+### Secrets:
+- `CONFIG_JSON` (full `config.json` contents)
 - `FB_PAGE_ID`
 - `FB_ACCESS_TOKEN` (Page Access Token)
 - `IG_USER_ID`
 - `IG_ACCESS_TOKEN` (User Access Token)
-- `GEMINI_API_KEY` (optional)
-- `GIST_TOKEN` (for state persistence)
+- `GIST_TOKEN` & `GIST_ID` (for `state.json` persistence)
+- `TWITTER_COOKIES` (optional, backup cookie-authenticated channel)
 
 ## Limitations
 
-- Instagram videos must be under 5 minutes (for Reels)
-- Instagram requires public URL for media (uses catbox.moe for video hosting)
-- **Instagram posts immediately** (no API scheduling support) - all IG posts go out at once
-- **Facebook uses native scheduling** - posts are spaced 10 minutes apart
-- Facebook token expires after 60 days (needs renewal)
-
+- Instagram Reels must be between 3 seconds and 15 minutes
+- Instagram image posts require temporary public hosting (uploaded via Freeimage.host / Tmpfiles.org / ImgBB)
+- **Instagram posts immediately** (API scheduling is not used)
+- **Facebook uses native scheduling** for queued multi-posts, spaced by `schedule_gap_minutes`
+- Facebook tokens expire after 60 days unless refreshed
 
 ## License
 
