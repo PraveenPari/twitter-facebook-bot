@@ -1,7 +1,7 @@
 """
-Multi-channel X/Twitter timeline fetcher (replaces Nitter).
+Multi-channel X/Twitter fetcher (replaces Nitter).
 
-Channels tried in order (until one returns tweets or detects a suspended account):
+Account timelines are tried in order (until one returns tweets or detects a suspended account):
 1. FxTwitter v2 API (https://api.fxtwitter.com/2/...) - zero auth, fast, structured JSON
    1a. /2/profile/{id:user_id | handle}/statuses
    1b. /2/search?q=from:{handle}&feed=latest (handles transient profile 404s & renames)
@@ -9,11 +9,16 @@ Channels tried in order (until one returns tweets or detects a suspended account
 3. twikit / twifork (optional, when X cookies are provided via TWITTER_COOKIES or twitter_cookies.json)
 4. X Guest GraphQL (api.x.com guest token + x.com/i/api/graphql)
 5. X Syndication Embed API (https://syndication.twitter.com/srv/timeline-profile/screen-name/{handle})
+
+Hashtag / keyword searches (e.g. "#TVK") use FxTwitter's public `/2/search` endpoint first,
+with the cookie-authenticated twifork client as a fallback. Direct logged-out X GraphQL search
+is not used because X blocks it for guest tokens.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 import json
 import logging
 import os
@@ -49,6 +54,10 @@ X_WEB_BEARER_TOKEN = (
 X_GQL_BASE = "https://x.com/i/api/graphql"
 X_OP_USER_BY_SCREEN = "Gb-d6r0vxPOADdG62OEBpQ/UserByScreenName"
 X_OP_USER_TWEETS = "SXVCYB8XHSS25nzIljNtZA/UserTweets"
+
+# Search product tabs accepted by the cookie-authenticated twifork client
+SEARCH_PRODUCT_LATEST = "Latest"
+SEARCH_PRODUCT_MEDIA = "Media"
 
 # Max estimated MP4 size (bytes) to target when choosing a bitrate variant for FB/IG compatibility
 MAX_PREFERRED_VIDEO_BYTES = 100 * 1024 * 1024
@@ -384,6 +393,98 @@ class TwitterFetcher:
         return asyncio.run(self.afetch_user_tweets(username, limit=limit))
 
     # ------------------------------------------------------------------
+    # Hashtag / keyword search
+    # ------------------------------------------------------------------
+
+    async def asearch_tweets(
+        self,
+        query: str,
+        limit: int = 40,
+        media_only: bool = False,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Search public posts by hashtag/keyword, newest first.
+
+        FxTwitter's public `/2/search` endpoint is the preferred source. If it is unavailable,
+        fall back to the cookie-authenticated twifork client. X's logged-out guest GraphQL
+        search is deliberately not used because X blocks it for guest tokens.
+        """
+        query = (query or "").strip()
+        if not query:
+            return [], "invalid_query"
+
+        fx_returned_empty = False
+        try:
+            tweets = await asyncio.to_thread(self._search_fxtwitter, query, limit, media_only)
+            if tweets:
+                return _sort_tweets_newest_first(tweets), "fxtwitter-search"
+            fx_returned_empty = tweets == []
+        except Exception as e:
+            logger.debug(f"[SEARCH {query}] fxtwitter search failed: {e}")
+
+        if self._cookies:
+            try:
+                tweets = await self._search_twikit(query, limit, media_only=media_only)
+                if tweets:
+                    return _sort_tweets_newest_first(tweets), "twikit-search"
+                if tweets == []:
+                    return [], "empty"
+            except Exception as e:
+                logger.warning(f"[SEARCH {query}] cookie search failed: {e}")
+
+        if fx_returned_empty:
+            return [], "empty"
+        return [], ("none" if self._cookies else "search_unavailable")
+
+    def search_tweets(
+        self,
+        query: str,
+        limit: int = 40,
+        media_only: bool = False,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Synchronous wrapper for asearch_tweets."""
+        return asyncio.run(self.asearch_tweets(query, limit=limit, media_only=media_only))
+
+    async def _search_twikit(
+        self, query: str, limit: int, media_only: bool = False
+    ) -> list[dict[str, Any]] | None:
+        client = self._get_twikit_client()
+        if client is None:
+            return None
+
+        if media_only:
+            results = await client.search_tweet(query, SEARCH_PRODUCT_MEDIA, count=limit)
+        else:
+            results = await client.search_tweet(query, SEARCH_PRODUCT_LATEST, count=limit)
+
+        out: list[dict[str, Any]] = []
+        for tw in list(results or [])[:limit]:
+            parsed = self._parse_twikit_tweet(tw, source="twikit-search")
+            if parsed:
+                out.append(parsed)
+        return out
+
+    def _search_fxtwitter(
+        self, query: str, limit: int, media_only: bool = False
+    ) -> list[dict[str, Any]] | None:
+        params: dict[str, Any] = {
+            "q": query,
+            "feed": "media" if media_only else "latest",
+            "count": min(max(limit, 1), 100),
+        }
+        data, _ = self._request_fxtwitter_json("/2/search", params=params, attempts=2)
+        if not data:
+            return None
+        results = data.get("results")
+        if not isinstance(results, list):
+            return None
+        return self._parse_fxtwitter_statuses(
+            results[:limit],
+            query,
+            source="fxtwitter-search",
+            cache_user_id=False,
+        )
+
+    # ------------------------------------------------------------------
     # Channel 1: FxTwitter v2 API
     # ------------------------------------------------------------------
 
@@ -456,6 +557,7 @@ class TwitterFetcher:
         username: str,
         source: str,
         filter_other_replies: bool = False,
+        cache_user_id: bool = True,
     ) -> list[dict[str, Any]]:
         parsed: list[dict[str, Any]] = []
         for item in results:
@@ -482,7 +584,8 @@ class TwitterFetcher:
                 if reply_target and reply_target != author_screen.lower():
                     continue
 
-            self._cache_user_id_from_fx_item(username, item)
+            if cache_user_id:
+                self._cache_user_id_from_fx_item(username, item)
 
             media_url, video_url, media_urls, has_video, duration = self._parse_fx_media(item.get("media"))
 
@@ -716,18 +819,36 @@ class TwitterFetcher:
     # Channel 3: Optional twikit/twifork with X cookies
     # ------------------------------------------------------------------
 
+    def _import_twikit_client(self) -> Any:
+        """Import the X cookie client class, trying twikit and then twifork.
+
+        `twifork` ships the same module under the `twikit` package name, but it is also
+        importable as `twifork` when only that distribution is installed, so both are tried.
+        """
+        for module_name in ("twikit", "twifork"):
+            try:
+                return importlib.import_module(module_name).Client
+            except (ImportError, AttributeError):
+                continue
+        return None
+
     def _get_twikit_client(self) -> Any:
         if self._twikit_init_attempted:
             return self._twikit_client
         self._twikit_init_attempted = True
-        try:
-            from twikit import Client  # provided by twifork or twikit
-        except ImportError:
+
+        client_cls = self._import_twikit_client()
+        if client_cls is None:
             logger.debug("twikit/twifork not installed; skipping cookie channel.")
             return None
 
-        client = Client("en-US")
-        client.set_cookies(self._cookies)
+        try:
+            client = client_cls("en-US")
+            client.set_cookies(self._cookies)
+        except Exception as e:
+            logger.warning(f"Could not initialise the cookie client: {e}")
+            return None
+
         self._twikit_client = client
         return client
 
@@ -748,81 +869,100 @@ class TwitterFetcher:
 
         tweets_res = await client.get_user_tweets(user_id, "Tweets", count=limit)
         out: list[dict[str, Any]] = []
-
-        for tw in list(tweets_res)[:limit]:
-            tid = str(getattr(tw, "id", "") or "").strip()
-            if not tid:
-                continue
-
-            retweeted = getattr(tw, "retweeted_tweet", None)
-            is_retweet = retweeted is not None
-            if is_retweet and not self.include_retweets:
-                continue
-
-            src_tw = retweeted if (retweeted is not None and not getattr(tw, "media", None)) else tw
-            text = getattr(src_tw, "full_text", None) or getattr(tw, "text", "") or ""
-
-            dt = getattr(tw, "created_at_datetime", None)
-            if dt is not None:
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                ts = dt.astimezone(timezone.utc).timestamp()
-            else:
-                ts = parse_timestamp(getattr(tw, "created_at", None), tid)
-
-            media_list = list(getattr(src_tw, "media", None) or [])
-            if not media_list and getattr(src_tw, "quote", None) is not None:
-                media_list = list(getattr(src_tw.quote, "media", None) or [])
-
-            has_video = False
-            video_url = None
-            media_url = None
-            media_urls: list[str] = []
-            duration = None
-
-            for m in media_list:
-                m_type = getattr(m, "type", "")
-                if m_type in ("video", "animated_gif"):
-                    has_video = True
-                    dur_ms = getattr(m, "duration_millis", None)
-                    duration = dur_ms / 1000.0 if dur_ms else None
-                    streams = getattr(m, "streams", None) or []
-                    fmt_dicts = [
-                        {
-                            "url": getattr(s, "url", None),
-                            "bitrate": getattr(s, "bitrate", 0) or 0,
-                            "content_type": getattr(s, "content_type", "") or "",
-                        }
-                        for s in streams
-                    ]
-                    video_url = _select_best_mp4_format(fmt_dicts, duration_sec=duration)
-                    media_url = getattr(m, "media_url", None) or video_url
-                    break
-                elif m_type == "photo":
-                    u = getattr(m, "source_url", None) or _ensure_orig_image_url(getattr(m, "media_url", None))
-                    if u:
-                        media_urls.append(u)
-                        if not media_url:
-                            media_url = u
-
-            author_handle = getattr(getattr(tw, "user", None), "screen_name", None) or username
-            out.append({
-                "id": tid,
-                "text": text,
-                "link": f"https://x.com/{author_handle}/status/{tid}",
-                "media_url": media_url,
-                "video_url": video_url,
-                "media_urls": media_urls,
-                "has_video": has_video,
-                "video_duration": duration,
-                "created_timestamp": ts,
-                "date_str": format_utc_date(ts, str(getattr(tw, "created_at", ""))),
-                "is_pinned": tid in pinned_ids,
-                "is_retweet": is_retweet,
-                "source": "twikit-cookies",
-            })
-
+        for tw in list(tweets_res or [])[:limit]:
+            parsed = self._parse_twikit_tweet(
+                tw,
+                source="twikit-cookies",
+                is_pinned=str(getattr(tw, "id", "")) in pinned_ids,
+            )
+            if parsed:
+                out.append(parsed)
         return out
+
+    def _parse_twikit_tweet(
+        self,
+        tw: Any,
+        source: str = "twikit-cookies",
+        is_pinned: bool = False,
+    ) -> dict[str, Any] | None:
+        """Convert a twikit/twifork Tweet object into the bot's common tweet dict."""
+        tid = str(getattr(tw, "id", "") or "").strip()
+        if not tid:
+            return None
+
+        retweeted = getattr(tw, "retweeted_tweet", None)
+        is_retweet = retweeted is not None
+        if is_retweet and not self.include_retweets:
+            return None
+
+        src_tw = retweeted if (retweeted is not None and not getattr(tw, "media", None)) else tw
+        text = getattr(src_tw, "full_text", None) or getattr(tw, "text", "") or ""
+
+        dt = getattr(tw, "created_at_datetime", None)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.astimezone(timezone.utc).timestamp()
+        else:
+            ts = parse_timestamp(getattr(tw, "created_at", None), tid)
+
+        media_list = list(getattr(src_tw, "media", None) or [])
+        if not media_list and getattr(src_tw, "quote", None) is not None:
+            media_list = list(getattr(src_tw.quote, "media", None) or [])
+
+        has_video = False
+        video_url = None
+        media_url = None
+        media_urls: list[str] = []
+        duration = None
+
+        for m in media_list:
+            m_type = getattr(m, "type", "")
+            if m_type in ("video", "animated_gif"):
+                has_video = True
+                dur_ms = getattr(m, "duration_millis", None)
+                duration = dur_ms / 1000.0 if dur_ms else None
+                streams = getattr(m, "streams", None) or []
+                fmt_dicts = [
+                    {
+                        "url": getattr(s, "url", None),
+                        "bitrate": getattr(s, "bitrate", 0) or 0,
+                        "content_type": getattr(s, "content_type", "") or "",
+                    }
+                    for s in streams
+                ]
+                video_url = _select_best_mp4_format(fmt_dicts, duration_sec=duration)
+                media_url = getattr(m, "media_url", None) or video_url
+                break
+            elif m_type == "photo":
+                u = getattr(m, "source_url", None) or _ensure_orig_image_url(
+                    getattr(m, "media_url", None)
+                )
+                if u:
+                    media_urls.append(u)
+                    if not media_url:
+                        media_url = u
+
+        author_handle = (
+            getattr(getattr(tw, "user", None), "screen_name", None)
+            or getattr(getattr(src_tw, "user", None), "screen_name", None)
+            or "i"
+        )
+        return {
+            "id": tid,
+            "text": text,
+            "link": f"https://x.com/{author_handle}/status/{tid}",
+            "media_url": media_url,
+            "video_url": video_url,
+            "media_urls": media_urls,
+            "has_video": has_video,
+            "video_duration": duration,
+            "created_timestamp": ts,
+            "date_str": format_utc_date(ts, str(getattr(tw, "created_at", "") or "")),
+            "is_pinned": is_pinned,
+            "is_retweet": is_retweet,
+            "source": source,
+        }
 
     # ------------------------------------------------------------------
     # Channel 4: Direct X Guest GraphQL

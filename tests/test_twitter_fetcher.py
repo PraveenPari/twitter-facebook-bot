@@ -687,7 +687,7 @@ def test_main_async_end_to_end(monkeypatch, tmp_path):
         ],
         "facebook": {"page_id": "fb_page_1", "access_token": "fb_tok"},
         "instagram": {"enabled": True, "user_id": "ig_user_1", "access_token": "ig_tok"},
-        "settings": {"post_window_minutes": 10, "schedule_gap_minutes": 15},
+        "settings": {"post_window_minutes": 10, "schedule_gap_minutes": 15, "hashtag_search": {"enabled": False}},
         "youtube_restream": {"enabled": False},
     }
     Path("config.json").write_text(json.dumps(config), encoding="utf-8")
@@ -891,7 +891,7 @@ def test_main_async_schedule_spacing_and_download_failure(monkeypatch, tmp_path)
         ],
         "facebook": {"page_id": "fb_page_1", "access_token": "fb_tok"},
         "instagram": {"enabled": False},
-        "settings": {"post_window_minutes": 60, "schedule_gap_minutes": 15},
+        "settings": {"post_window_minutes": 60, "schedule_gap_minutes": 15, "hashtag_search": {"enabled": False}},
     }
     Path("config.json").write_text(json.dumps(config), encoding="utf-8")
 
@@ -958,6 +958,7 @@ def test_main_async_exits_nonzero_when_all_reachable_fail(monkeypatch, tmp_path)
         "twitter_accounts": [{"id": "a1", "username": "User1"}],
         "facebook": {"page_id": "fb_page_1", "access_token": "fb_tok"},
         "instagram": {"enabled": False},
+        "settings": {"hashtag_search": {"enabled": False}},
     }
     Path("config.json").write_text(json.dumps(config), encoding="utf-8")
 

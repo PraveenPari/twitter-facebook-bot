@@ -29,8 +29,21 @@
   },
   "settings": {
     "post_window_minutes": 60,
+    "max_lookback_minutes": 1440,
+    "max_posts_per_account": 3,
+    "max_posts_per_run": 10,
     "schedule_gap_minutes": 10,
-    "min_content_length": 5
+    "min_content_length": 5,
+    "hashtag_search": {
+      "enabled": true,
+      "queries": [
+        { "id": "hashtag_tvk", "query": "#TVK" },
+        { "id": "hashtag_tvkparty", "query": "#TVKParty" },
+        { "id": "hashtag_thalapathy_vijay", "query": "#ThalapathyVijay" }
+      ],
+      "limit": 40,
+      "media_only": false
+    }
   },
   "youtube_restream": {
     "enabled": true,
