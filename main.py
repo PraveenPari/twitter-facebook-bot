@@ -133,6 +133,236 @@ def extract_username(acc):
     return username
 
 
+def resolve_effective_lookback(config, state, now_ts=None):
+    """Widen the lookback window when the scheduler ran late.
+
+    GitHub's shared runners frequently delay the 30-minute cron by hours, so a fixed 60-minute
+    window silently drops every tweet published in the gap: the run only sees what happens to
+    be inside the last hour. Widening to the real time since the previous run (bounded by
+    ``settings.max_lookback_minutes``) lets the bot catch up without re-posting old content —
+    posted tweet IDs are still deduplicated through ``state``.
+    """
+    lookback_minutes = resolve_lookback_minutes(config)
+    settings = config.get('settings', {}) if isinstance(config, dict) else {}
+
+    try:
+        max_minutes = float(settings.get('max_lookback_minutes', 24 * 60))
+    except (TypeError, ValueError):
+        max_minutes = float(24 * 60)
+    max_minutes = max(lookback_minutes, max_minutes)
+
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    last_run_ts = state.get('last_run_ts') if isinstance(state, dict) else None
+    try:
+        last_run_ts = float(last_run_ts)
+    except (TypeError, ValueError):
+        last_run_ts = None
+
+    if last_run_ts is None or last_run_ts > now_ts:
+        return lookback_minutes
+
+    # 5 minutes of slack absorbs small clock/ordering differences between runs.
+    gap_minutes = (now_ts - last_run_ts) / 60.0 + 5.0
+    effective = min(max(lookback_minutes, gap_minutes), max_minutes)
+    if effective > lookback_minutes:
+        logger.info(
+            f"[CATCHUP] Previous run was {gap_minutes - 5:.0f} min ago; "
+            f"widening lookback from {lookback_minutes:.0f} to {effective:.0f} min"
+        )
+    return effective
+
+
+def resolve_max_posts_per_account(config):
+    """Max number of posts to publish per source per run (bounded 1..10)."""
+    settings = config.get('settings', {}) if isinstance(config, dict) else {}
+    env_val = os.environ.get('MAX_POSTS_PER_ACCOUNT')
+    raw = env_val if env_val is not None else settings.get('max_posts_per_account', 3)
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return 3
+    return max(1, min(parsed, 10))
+
+
+def resolve_max_posts_per_run(config):
+    """Max number of posts to publish in a single run across all sources (bounded 1..30)."""
+    settings = config.get('settings', {}) if isinstance(config, dict) else {}
+    env_val = os.environ.get('MAX_POSTS_PER_RUN')
+    raw = env_val if env_val is not None else settings.get('max_posts_per_run', 10)
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return 10
+    return max(1, min(parsed, 30))
+
+
+def extract_hashtags(config):
+    """Collect hashtag/keyword search sources from config.
+
+    Accepts either plain strings ("#TVK") or objects ({"query": "#TVK", "id": "tvk_tag"}).
+    Returns a de-duplicated list of {"id", "query"} dicts.
+    """
+    if not isinstance(config, dict):
+        return []
+
+    settings = config.get('settings', {})
+    search_cfg = config.get('hashtag_search') or settings.get('hashtag_search') or {}
+    if isinstance(search_cfg, dict) and not search_cfg.get('enabled', True):
+        return []
+
+    raw = None
+    if isinstance(search_cfg, dict):
+        raw = (
+            search_cfg.get('queries')
+            or search_cfg.get('hashtag_feeds')
+            or search_cfg.get('feeds')
+        )
+    elif isinstance(search_cfg, (str, list)):
+        raw = search_cfg
+    if raw is None:
+        raw = (
+            config.get('hashtag_feeds')
+            or settings.get('hashtag_feeds')
+            or config.get('hashtags')
+            or config.get('searches')
+        )
+    # Keep TVK discovery enabled for existing CONFIG_JSON secrets that predate the new setting.
+    # Users can explicitly turn it off with hashtag_search.enabled = false.
+    if not raw:
+        raw = [{'id': 'hashtag_tvk', 'query': '#TVK'}]
+    if isinstance(raw, (str, dict)):
+        raw = [raw]
+
+    out = []
+    seen = set()
+    for idx, item in enumerate(raw):
+        if isinstance(item, str):
+            query = item.strip()
+            feed_id = f"hashtag_{re.sub(r'[^A-Za-z0-9]+', '_', query.strip('#')) or idx}"
+        elif isinstance(item, dict):
+            query = (item.get('query') or item.get('q') or item.get('hashtag') or '').strip()
+            feed_id = (item.get('id') or '').strip() or (
+                f"hashtag_{re.sub(r'[^A-Za-z0-9]+', '_', query.strip('#')) or idx}"
+            )
+        else:
+            continue
+
+        if not query:
+            continue
+        # Bare single words are treated as hashtags; phrases/operators are passed through as-is.
+        if (
+            ' ' not in query
+            and not query.startswith(('#', '@'))
+            and ':' not in query
+        ):
+            query = f"#{query}"
+
+        key = query.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({'id': feed_id, 'query': query})
+
+    return out
+
+
+def select_tweets_for_posting(
+    tweets,
+    feed_id,
+    state,
+    max_age_seconds,
+    now_ts,
+    max_per_feed,
+    return_backlog=False,
+):
+    """Pick the publishable tweets for one source, newest usable first.
+
+    Previously only ``posts_within_window[0]`` was ever queued, so every source contributed a
+    single post per run and anything posted afterwards was silently dropped: the next run's
+    lookback window had already moved past it. Now up to ``max_per_feed`` distinct media posts
+    are returned so a source with several new videos/photos is not throttled to one item.
+    """
+    publishable = []
+
+    for tweet in tweets:
+        tweet_id = str(tweet.get('id') or '').strip()
+        if not tweet_id:
+            continue
+
+        if tweet.get('is_pinned'):
+            continue
+
+        if is_already_posted(state, feed_id, tweet_id):
+            continue
+
+        if not tweet.get('has_video') and not tweet.get('media_url'):
+            continue
+
+        within_window, age_str = is_tweet_within_window(tweet, max_age_seconds, now_ts=now_ts)
+        if not within_window:
+            continue
+
+        media_type = "VIDEO" if tweet.get('has_video') else "IMAGE"
+        candidate = dict(tweet)
+        candidate['id'] = tweet_id
+        candidate['media_type'] = media_type
+        candidate['age_seconds'] = _tweet_age_seconds(tweet, now_ts)
+        publishable.append((candidate, age_str))
+
+    # Newest first, then trim to the per-source cap. Tell the caller if the run must keep its
+    # catch-up watermark so older eligible posts can be fetched again on the next invocation.
+    publishable.sort(key=lambda pair: pair[0]['age_seconds'])
+    truncated = len(publishable) > max_per_feed
+    selected = publishable[:max_per_feed]
+    return (selected, truncated) if return_backlog else selected
+
+
+def _tweet_age_seconds(tweet, now_ts):
+    ts = tweet.get('created_timestamp')
+    if ts is None:
+        ts = parse_timestamp(tweet.get('date_str'), tweet.get('id'))
+    if ts is None:
+        return float('inf')
+    return max(0.0, float(now_ts) - float(ts))
+
+
+def trim_posts_for_run(posts, max_posts):
+    """Keep a balanced, newest-first slice of the queue for a single run.
+
+    Videos keep their traditional priority, but no single source may take more than one slot
+    in this run while other sources still have queued posts waiting, so one busy account cannot
+    starve the rest.
+    """
+    remainder = sorted(
+        posts,
+        key=lambda item: (
+            not bool(item['tweet'].get('has_video')),
+            item.get('age_seconds') if item.get('age_seconds') is not None else float('inf'),
+        ),
+    )
+
+    selected = []
+    deferred = []
+    used_feeds = set()
+
+    for item in remainder:
+        if len(selected) >= max_posts:
+            deferred.append(item)
+            continue
+        if item['feed_id'] in used_feeds:
+            deferred.append(item)
+            continue
+        selected.append(item)
+        used_feeds.add(item['feed_id'])
+
+    for item in deferred:
+        if len(selected) >= max_posts:
+            break
+        selected.append(item)
+
+    return selected
+
+
 def resolve_lookback_minutes(config):
     """Resolve lookback window in minutes, honoring env override while keeping a 60-min safety floor."""
     env_val = os.environ.get('POST_WINDOW_MINUTES')
@@ -649,10 +879,12 @@ async def main_async():
 
     # 2. Fetch X/Twitter timelines (FxTwitter API/RSS -> optional twikit -> X Guest GraphQL -> Syndication)
     settings = config.get('settings', {}) if isinstance(config, dict) else {}
-    lookback_minutes = resolve_lookback_minutes(config)
+    lookback_minutes = resolve_effective_lookback(config, state)
     max_age_seconds = lookback_minutes * 60.0
     schedule_gap_minutes = max(1, int(settings.get('schedule_gap_minutes', 10) or 10))
     include_retweets = settings.get('include_retweets', True)
+    max_posts_per_account = resolve_max_posts_per_account(config)
+    max_per_run = resolve_max_posts_per_run(config)
     twitter_cfg = config.get('twitter', {}) if isinstance(config, dict) else {}
 
     fetcher = TwitterFetcher(
@@ -662,7 +894,12 @@ async def main_async():
     )
 
     accounts = config.get('feeds', []) or config.get('twitter_accounts', [])
-    logger.info(f"Loaded {len(accounts)} accounts to check (lookback: {lookback_minutes:.0f} min).")
+    account_count = len(accounts)
+    hashtag_sources = extract_hashtags(config)
+    logger.info(
+        f"Loaded {len(accounts)} accounts and {len(hashtag_sources)} hashtag searches "
+        f"(lookback: {lookback_minutes:.0f} min, max {max_per_run} posts/run)."
+    )
 
     usernames = [extract_username(acc) for acc in accounts]
     results_list = [[] for _ in accounts]
@@ -734,12 +971,63 @@ async def main_async():
     success_count = sum(1 for src in fetch_sources if src not in ('none', 'suspended', 'invalid_username'))
     logger.info(f"[DONE] Checked {success_count}/{len(accounts)} reachable accounts successfully")
 
+    # Hashtag / keyword searches (e.g. #TVK). These are extra sources appended to the same
+    # result lists so they flow through the identical filtering, dedupe and posting pipeline.
+    search_cfg = config.get('hashtag_search') or settings.get('hashtag_search') or {}
+    try:
+        hashtag_limit = max(1, min(int(search_cfg.get('limit', 40)), 100))
+    except (AttributeError, TypeError, ValueError):
+        hashtag_limit = 40
+    hashtag_media_only = bool(search_cfg.get('media_only', False)) if isinstance(search_cfg, dict) else False
+    hashtag_fetch_failed = False
+
+    if hashtag_sources:
+        for item in hashtag_sources:
+            query = item['query']
+            feed_id = item['id']
+            logger.info(f"[SEARCH] Fetching posts for {query}...")
+            try:
+                tweets, source = await fetcher.asearch_tweets(
+                    query,
+                    limit=hashtag_limit,
+                    media_only=hashtag_media_only,
+                )
+            except Exception as e:
+                logger.error(f"[SEARCH ERROR] {query}: {e}")
+                tweets, source = [], 'none'
+
+            accounts.append({'id': feed_id, 'username': feed_id})
+            usernames.append(query)
+            results_list.append(tweets or [])
+            fetch_sources.append(source)
+            if source in ('none', 'search_unavailable'):
+                hashtag_fetch_failed = True
+
+            if tweets:
+                logger.info(f"[SEARCH OK] {query} ({source}): Got {len(tweets)} tweets")
+            elif source == 'search_unavailable':
+                logger.warning(
+                    f"[SEARCH UNAVAILABLE] {query}: public search did not return results. "
+                    f"Check FxTwitter availability or set TWITTER_COOKIES (auth_token + ct0) "
+                    f"for authenticated X search."
+                )
+            else:
+                logger.info(f"[SEARCH] {query} ({source}): 0 tweets")
+
+            await asyncio.sleep(1.5)
+
     # Persist newly cached user_ids right away
     save_state(state)
 
     # Process results
     now_ts = time.time()
     posts_to_make = []
+    has_post_backlog = False
+    incomplete_fetch = hashtag_fetch_failed or any(
+        source in ('none', 'search_unavailable')
+        for source in fetch_sources[:account_count]
+    )
+
     for i, tweets in enumerate(results_list):
         acc = accounts[i]
         feed_id = acc.get('id') or extract_username(acc) or 'unknown'
@@ -755,39 +1043,22 @@ async def main_async():
                 logger.info(f"[{feed_id}] No tweets returned ({source})")
             continue
 
-        posts_within_window = []
-        for tweet in tweets:
-            tweet_id = str(tweet.get('id') or '').strip()
-            if not tweet_id:
-                continue
-
-            if tweet.get('is_pinned'):
-                continue
-
-            if is_already_posted(state, feed_id, tweet_id):
-                continue
-
-            if not tweet.get('has_video') and not tweet.get('media_url'):
-                continue
-
-            within_window, age_str = is_tweet_within_window(tweet, max_age_seconds, now_ts=now_ts)
-            if within_window:
-                media_type = "VIDEO" if tweet.get('has_video') else "IMAGE"
-                posts_within_window.append({
-                    'id': tweet_id,
-                    'type': media_type,
-                    'age': age_str,
-                })
-
-        if posts_within_window:
-            for p in posts_within_window:
-                logger.info(f"[FOUND] [{feed_id}] {p['type']} {p['id']} (Age: {p['age']}, via {source})")
-
-            best = posts_within_window[0]
-            best_tweet = next(t for t in tweets if str(t.get('id')) == best['id'])
+        selected, source_truncated = select_tweets_for_posting(
+            tweets,
+            feed_id,
+            state,
+            max_age_seconds,
+            now_ts,
+            max_posts_per_account,
+            return_backlog=True,
+        )
+        has_post_backlog = has_post_backlog or source_truncated
+        for tweet, age_str in selected:
+            logger.info(f"[FOUND] [{feed_id}] {tweet['media_type']} {tweet['id']} (Age: {age_str}, via {source})")
             posts_to_make.append({
                 'feed_id': feed_id,
-                'tweet': best_tweet,
+                'tweet': tweet,
+                'age_seconds': tweet.get('age_seconds'),
             })
 
     # Deduplicate same tweet ID across multiple accounts (e.g. retweets), preferring non-retweet
@@ -798,6 +1069,16 @@ async def main_async():
         if existing is None or (existing['tweet'].get('is_retweet') and not item['tweet'].get('is_retweet')):
             deduped_posts[tid] = item
     posts_to_make = list(deduped_posts.values())
+
+    logger.info(f"Found {len(posts_to_make)} new posts with media (limit {max_per_run} per run).")
+
+    # Cap the number of posts per run so a backlog never floods the page. Keep the old
+    # catch-up watermark if anything remains unselected; the posted-ID set will remove the
+    # already delivered items on the next run and let the remaining backlog drain safely.
+    if len(posts_to_make) > max_per_run:
+        has_post_backlog = True
+        logger.info(f"[CAP] Keeping {max_per_run} of {len(posts_to_make)} posts for this run")
+        posts_to_make = trim_posts_for_run(posts_to_make, max_per_run)
 
     logger.info(f"Found {len(posts_to_make)} new posts with media.")
 
@@ -821,6 +1102,7 @@ async def main_async():
     post_stats = []
     downloaded_files = []
     ready_post_count = 0
+    has_unposted_failures = False
 
     for item in all_posts:
         tweet = item['tweet']
@@ -835,6 +1117,7 @@ async def main_async():
 
         if not media_path:
             logger.error(f"Failed to download {media_type} for {item['feed_id']}")
+            has_unposted_failures = True
             post_stats.append({
                 'id': item['feed_id'],
                 'type': media_type.lower(),
@@ -902,6 +1185,9 @@ async def main_async():
                 'error': ig_res.get('error'),
             })
 
+        if not fb_success and not ig_success:
+            has_unposted_failures = True
+
         if fb_success or ig_success:
             record_posted_tweet(state, item['feed_id'], str(tweet['id']))
             save_state(state)
@@ -912,12 +1198,27 @@ async def main_async():
                 ig_status_str = "IG:OK" if ig_success else "IG:FAIL/SKIP"
                 logger.info(f"[OK] {media_type} posted (FB:OK {ig_status_str}) for {item['feed_id']}")
 
+    # Advance the catch-up watermark only when every source was checked and no post is still
+    # queued or failed. On the first run, retain the start of the attempted window instead.
+    should_advance_watermark = not incomplete_fetch and not has_post_backlog and not has_unposted_failures
+    previous_run_ts = state.get('last_run_ts')
+    if should_advance_watermark:
+        state['last_run_ts'] = now_ts
+    elif previous_run_ts is None:
+        state['last_run_ts'] = max(0.0, now_ts - max_age_seconds)
+        logger.info("[CATCHUP] Holding the initial lookback watermark because work remains pending")
+    else:
+        logger.info("[CATCHUP] Holding the previous watermark; pending sources/posts will be retried")
+    save_state(state)
+
     # Save Reports
     run_timestamp = datetime.now().isoformat()
 
     report = {
         'timestamp': run_timestamp,
-        'accounts_checked': len(accounts),
+        'accounts_checked': account_count,
+        'searches_checked': len(hashtag_sources),
+        'hashtag_queries': [item['query'] for item in hashtag_sources],
         'lookback_minutes': lookback_minutes,
         'new_posts_found': len(posts_to_make),
         'fetch_sources': {
@@ -1013,7 +1314,9 @@ async def main_async():
 
     logger.info("Bot Run Completed. Reports generated: run_report.json, cucumber_report.json")
 
-    if accounts and success_count == 0 and any(src != 'suspended' for src in fetch_sources):
+    if account_count and success_count == 0 and any(
+        src != 'suspended' for src in fetch_sources[:account_count]
+    ):
         logger.error("All reachable X/Twitter accounts failed to fetch across all channels.")
         raise SystemExit(1)
 

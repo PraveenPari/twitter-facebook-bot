@@ -10,6 +10,7 @@ Automated bot that monitors public X/Twitter accounts (without Nitter or paid X 
   3. **Optional X Cookies (`twifork`/`twikit`)** via `TWITTER_COOKIES` env var or `twitter_cookies.json`
   4. **Direct X Guest GraphQL** (`api.x.com` guest token + GraphQL timeline)
   5. **X Syndication Embed API** fallback
+- 🔎 Hashtag / keyword discovery (enabled by default for `#TVK`; add more queries such as `#TVKParty` and `#ThalapathyVijay`) using FxTwitter search and cookie-authenticated fallback
 - 📘 Posts to Facebook Pages (images and videos, with native scheduling)
 - 📸 Posts to Instagram Business Account (images and Reels up to 15 minutes via direct resumable upload)
 - ⏰ Scheduled Facebook posting spaced by `schedule_gap_minutes`
@@ -57,15 +58,28 @@ Automated bot that monitors public X/Twitter accounts (without Nitter or paid X 
   },
   "settings": {
     "post_window_minutes": 60,
-    "schedule_gap_minutes": 10
+    "max_lookback_minutes": 1440,
+    "max_posts_per_account": 3,
+    "max_posts_per_run": 10,
+    "schedule_gap_minutes": 10,
+    "hashtag_search": {
+      "enabled": true,
+      "queries": [
+        { "id": "hashtag_tvk", "query": "#TVK" },
+        { "id": "hashtag_tvkparty", "query": "#TVKParty" },
+        { "id": "hashtag_thalapathy_vijay", "query": "#ThalapathyVijay" }
+      ],
+      "limit": 40,
+      "media_only": false
+    }
   }
 }
 ```
 
-### Optional X/Twitter Cookies Fallback
-No X API key or login is needed for normal operation (FxTwitter v2 works out of the box). If you ever want a cookie-authenticated backup channel via `twifork`, export cookies (`auth_token`, `ct0`, etc.) from a logged-in browser session and supply them either:
-- as `TWITTER_COOKIES` environment variable / GitHub Secret (JSON object, cookie-editor JSON array, or `key=value; ...` string), or
-- in a local `twitter_cookies.json` file (already gitignored).
+### Hashtag search and optional X/Twitter cookies
+`#TVK` search is enabled by default, including for existing `CONFIG_JSON` secrets that predate this setting. Add the block shown above under `settings.hashtag_search` to search more tags or keywords. FxTwitter's public search is tried first. If it is unavailable, X's logged-out search is blocked, so the bot can fall back to `twifork` only when valid cookies are provided. For GitHub Actions, update the JSON stored in the `CONFIG_JSON` secret with the `hashtag_search` block from the template.
+
+No X API key or login is normally needed. To enable the authenticated fallback, export cookies (`auth_token`, `ct0`, etc.) from a logged-in browser session and supply them as the `TWITTER_COOKIES` environment variable / GitHub Secret (JSON object, cookie-editor JSON array, or `key=value; ...` string), or in a local `twitter_cookies.json` file (already gitignored). Never commit or share X cookies; they grant account access.
 
 ## Token Setup
 
@@ -87,11 +101,11 @@ No X API key or login is needed for normal operation (FxTwitter v2 works out of 
 python main.py
 ```
 
-Set `POST_WINDOW_MINUTES` to override the tweet lookback window in minutes (default: `60`).
+Set `POST_WINDOW_MINUTES` to override the base tweet lookback window in minutes (default: `60`). When a run is late, the bot widens the window to the time since the last fully processed run, up to `settings.max_lookback_minutes` (default: 24 hours). The watermark is held when there are unprocessed posts or failed sources, so the next invocation can drain the backlog without reposting IDs already delivered.
 
 ## GitHub Actions Deployment
 
-The bot runs on a 30-minute schedule via `.github/workflows/bot.yml` (no Playwright/Chromium or `xvfb-run` needed).
+The bot is requested on a 30-minute schedule via `.github/workflows/bot.yml` (no Playwright/Chromium or `xvfb-run` needed). GitHub Actions schedule events are best-effort and can be delayed or skipped, so this cannot guarantee an exact 30-minute cadence; catch-up logic preserves missed posts for later runs. Each run handles up to 3 media posts per source and 10 total by default, spaced using `schedule_gap_minutes`.
 
 ### Secrets:
 - `CONFIG_JSON` (full `config.json` contents)
@@ -100,7 +114,7 @@ The bot runs on a 30-minute schedule via `.github/workflows/bot.yml` (no Playwri
 - `IG_USER_ID`
 - `IG_ACCESS_TOKEN` (User Access Token)
 - `GIST_TOKEN` & `GIST_ID` (for `state.json` persistence)
-- `TWITTER_COOKIES` (optional, backup cookie-authenticated channel)
+- `TWITTER_COOKIES` (optional, cookie-authenticated fallback for timelines and hashtag search)
 
 ## Limitations
 

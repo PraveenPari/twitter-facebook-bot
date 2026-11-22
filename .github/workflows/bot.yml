@@ -2,8 +2,8 @@ name: Twitter to Facebook & Instagram Bot
 
 on:
   schedule:
-    # Run every 30 minutes
-    - cron: '*/30 * * * *'
+    # Run every 30 minutes, offset from the heavily queued start of each hour.
+    - cron: '7,37 * * * *'
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
@@ -71,15 +71,20 @@ jobs:
 
           sources = report.get("fetch_sources") or {}
           counts = Counter(sources.values())
+          hashtag_queries = set(report.get("hashtag_queries") or [])
           suspended = report.get("suspended_accounts") or []
           actions = report.get("facebook_actions") or []
           ok_actions = sum(1 for a in actions if a.get("status") == "success")
           fail_actions = sum(1 for a in actions if a.get("status") == "failed")
-          reachable = sum(1 for v in sources.values() if v not in ("none", "suspended", "invalid_username"))
+          reachable = sum(
+              1 for name, source in sources.items()
+              if name not in hashtag_queries and source not in ("none", "suspended", "invalid_username")
+          )
 
           src_summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
           notice = (
               f"checked={report.get('accounts_checked', 0)}, "
+              f"hashtag_searches={report.get('searches_checked', 0)}, "
               f"reachable={reachable}, "
               f"new_posts={report.get('new_posts_found', 0)}, "
               f"actions_ok={ok_actions}, actions_failed={fail_actions}, "
@@ -94,6 +99,7 @@ jobs:
               with open(summary_path, "a", encoding="utf-8") as sf:
                   sf.write("## Bot Run Summary\n\n")
                   sf.write(f"- **Accounts checked:** {report.get('accounts_checked', 0)}\n")
+                  sf.write(f"- **Hashtag searches:** {report.get('searches_checked', 0)}\n")
                   sf.write(f"- **Reachable:** {reachable}\n")
                   sf.write(f"- **Lookback window:** {report.get('lookback_minutes', 60)} min\n")
                   sf.write(f"- **New media posts found:** {report.get('new_posts_found', 0)}\n")
