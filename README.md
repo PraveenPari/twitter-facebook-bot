@@ -45,7 +45,8 @@ Automated bot that monitors public X/Twitter accounts (without Nitter or paid X 
 ```json
 {
   "twitter_accounts": [
-    { "id": "account_id", "username": "TwitterHandle" }
+    { "id": "account_id", "username": "TwitterHandle" },
+    { "id": "actor_vijay_univ", "username": "ActorVijayUniv" }
   ],
   "facebook": {
     "page_id": "YOUR_FB_PAGE_ID",
@@ -105,7 +106,7 @@ Set `POST_WINDOW_MINUTES` to override the base tweet lookback window in minutes 
 
 ## GitHub Actions Deployment
 
-The bot is requested on a 30-minute schedule via `.github/workflows/bot.yml` (no Playwright/Chromium or `xvfb-run` needed). GitHub Actions schedule events are best-effort and can be delayed or skipped, so this cannot guarantee an exact 30-minute cadence; catch-up logic preserves missed posts for later runs. Each run handles up to 3 media posts per source and 10 total by default, spaced using `schedule_gap_minutes`.
+The bot is requested on a 30-minute schedule via `.github/workflows/bot.yml` (no Playwright/Chromium or `xvfb-run` needed). GitHub Actions schedule events are best-effort and can be delayed or skipped, so this cannot guarantee an exact 30-minute cadence; catch-up logic preserves missed posts for later runs. Each run handles up to 3 media posts per source and 10 total by default, spaced using `schedule_gap_minutes`. Workflow-managed accounts in `EXTRA_TWITTER_ACCOUNTS` are merged into the `CONFIG_JSON` secret at runtime, so adding `ActorVijayUniv` does not require replacing that secret.
 
 ### Secrets:
 - `CONFIG_JSON` (full `config.json` contents)

@@ -51,11 +51,15 @@ except ImportError:
 def load_config():
     if os.path.exists('config.json'):
         with open('config.json', 'r', encoding='utf-8') as f:
-            return json.load(f)
-    config_str = os.environ.get('CONFIG_JSON')
-    if config_str:
-        return json.loads(config_str)
-    raise Exception("No config found!")
+            config = json.load(f)
+    else:
+        config_str = os.environ.get('CONFIG_JSON')
+        if not config_str:
+            raise Exception("No config found!")
+        config = json.loads(config_str)
+
+    return merge_extra_twitter_accounts(config)
+
 
 def load_state():
     state = {
@@ -131,6 +135,55 @@ def extract_username(acc):
         if parts:
             username = parts[-2] if parts[-1] == 'rss' and len(parts) >= 2 else parts[-1]
     return username
+
+
+def merge_extra_twitter_accounts(config, raw_extra=None):
+    """Merge workflow-managed extra accounts into the configured feed list once.
+
+    GitHub Actions stores the main configuration in CONFIG_JSON. This separate environment
+    value lets small source-controlled account additions take effect without needing access
+    to (or replacing) that secret.
+    """
+    raw_extra = os.environ.get('EXTRA_TWITTER_ACCOUNTS') if raw_extra is None else raw_extra
+    if not raw_extra:
+        return config
+
+    try:
+        extra_accounts = json.loads(raw_extra) if isinstance(raw_extra, str) else raw_extra
+    except json.JSONDecodeError as exc:
+        raise ValueError("EXTRA_TWITTER_ACCOUNTS must contain valid JSON") from exc
+
+    if isinstance(extra_accounts, dict):
+        extra_accounts = [extra_accounts]
+    if not isinstance(extra_accounts, list):
+        raise ValueError("EXTRA_TWITTER_ACCOUNTS must be a JSON list of account objects")
+    if not isinstance(config, dict):
+        raise ValueError("Bot configuration must be a JSON object")
+
+    # Match main_async's source selection: non-empty `feeds` takes precedence.
+    account_key = 'feeds' if config.get('feeds') else 'twitter_accounts'
+    accounts = config.setdefault(account_key, [])
+    if not isinstance(accounts, list):
+        raise ValueError(f"Configuration field {account_key!r} must be a list")
+
+    seen_handles = {
+        extract_username(account).casefold()
+        for account in accounts
+        if isinstance(account, dict) and extract_username(account)
+    }
+    for item in extra_accounts:
+        if not isinstance(item, dict):
+            raise ValueError("Each EXTRA_TWITTER_ACCOUNTS entry must be an object")
+        candidate = dict(item)
+        handle = extract_username(candidate)
+        if not handle:
+            raise ValueError("Each extra Twitter account must define a username or URL")
+        if handle.casefold() in seen_handles:
+            continue
+        accounts.append(candidate)
+        seen_handles.add(handle.casefold())
+
+    return config
 
 
 def resolve_effective_lookback(config, state, now_ts=None):

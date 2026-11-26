@@ -48,6 +48,7 @@ jobs:
           TWITTER_COOKIES: ${{ secrets.TWITTER_COOKIES }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+          EXTRA_TWITTER_ACCOUNTS: '[{"id":"actor_vijay_univ","username":"ActorVijayUniv"}]'
         run: |
           # Create config from secret
           printf '%s\n' "$CONFIG_JSON" > config.json
