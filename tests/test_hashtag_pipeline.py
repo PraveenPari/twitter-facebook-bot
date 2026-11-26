@@ -41,6 +41,45 @@ def _media_tweet(tweet_id, timestamp, *, video=False, author="NewsUser"):
     }
 
 
+def test_load_config_merges_workflow_managed_actor_vijay_account(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CONFIG_JSON", json.dumps({
+        "twitter_accounts": [{"id": "existing", "username": "OtherAccount"}],
+        "facebook": {"page_id": "page", "access_token": "token"},
+    }))
+    monkeypatch.setenv("EXTRA_TWITTER_ACCOUNTS", json.dumps([
+        {"id": "actor_vijay_univ", "username": "ActorVijayUniv"},
+        # Duplicate handles are ignored case-insensitively, including a leading @.
+        {"id": "actor_duplicate", "username": "@actorvijayuniv"},
+    ]))
+
+    config = bot_main.load_config()
+    handles = [account["username"] for account in config["twitter_accounts"]]
+    assert handles == ["OtherAccount", "ActorVijayUniv"]
+
+    template = json.loads((REPO_ROOT / "config.json.template").read_text(encoding="utf-8"))
+    assert any(
+        account.get("username") == "ActorVijayUniv"
+        for account in template["twitter_accounts"]
+    )
+
+
+def test_extra_account_merge_updates_preferred_feeds_list():
+    config = {
+        "feeds": [{"id": "news", "username": "NewsAccount"}],
+        "twitter_accounts": [{"id": "legacy", "username": "LegacyAccount"}],
+    }
+    bot_main.merge_extra_twitter_accounts(
+        config,
+        [{"id": "actor_vijay_univ", "username": "ActorVijayUniv"}],
+    )
+    assert [account["username"] for account in config["feeds"]] == [
+        "NewsAccount",
+        "ActorVijayUniv",
+    ]
+    assert [account["username"] for account in config["twitter_accounts"]] == ["LegacyAccount"]
+
+
 def test_hashtag_config_post_limits_and_catchup_window(monkeypatch):
     now_ts = 1_800_000_000.0
     config = {
